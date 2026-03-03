@@ -142,49 +142,10 @@ chmod +x ./*.sh 2>/dev/null || true
 #   JAVA_BIN (optional) explicit java path
 # -----------------------------
 find_java() {
-  # Usage:
-  #   find_java [mc_version] [loader_kind]
-  # If mc_version provided, pick a sensible major (8/17/21) when available.
-  local mc="${1:-}"
-  local kind="${2:-}"
-
-  # explicit override wins
   if [[ -n "${JAVA_BIN:-}" && -x "${JAVA_BIN}" ]]; then echo "${JAVA_BIN}"; return 0; fi
   if [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/java" ]]; then echo "${JAVA_HOME}/bin/java"; return 0; fi
-
-  have_java() { [[ -x "/opt/java/$1/bin/java" ]]; }
-
-  pick_by_major() {
-    local maj="$1"
-    if have_java "$maj"; then echo "/opt/java/$maj/bin/java"; return 0; fi
-    return 1
-  }
-
-  # If we know MC, choose major
-  if [[ -n "$mc" && "$mc" =~ ^1\.([0-9]+) ]]; then
-    local minor="${BASH_REMATCH[1]}"
-
-    # NeoForge tends to be Java 21+ for modern MC
-    if [[ "$kind" == "neoforge" ]]; then
-      pick_by_major 21 && return 0
-    fi
-
-    # 1.16 and older -> Java 8
-    if (( minor <= 16 )); then
-      pick_by_major 8 && return 0
-    fi
-
-    # 1.18–1.20 -> Java 17
-    if (( minor <= 20 )); then
-      pick_by_major 17 && return 0
-    fi
-
-    # 1.21+ -> Java 21
-    pick_by_major 21 && return 0
-  fi
-
-  # fallbacks
   if command -v java >/dev/null 2>&1; then command -v java; return 0; fi
+  # Common Pterodactyl yolk paths
   for p in /opt/java/*/bin/java /usr/lib/jvm/*/bin/java; do
     if [[ -x "$p" ]]; then echo "$p"; return 0; fi
   done
@@ -211,7 +172,7 @@ parse_manifest() {
 forge_install() {
   local mc="$1" forge_ver="$2"
   local java
-  java="$(find_java "$mc" "forge")" || die "java not found in PATH/JAVA_HOME (required to install Forge)."
+  java="$(find_java)" || die "java not found in PATH/JAVA_HOME (required to install Forge)."
   export PATH="$(dirname "$java"):$PATH"
   export JAVA_HOME="$(dirname "$(dirname "$java")")"
 
@@ -237,7 +198,7 @@ SH
 fabric_install() {
   local mc="$1" loader_ver="$2"
   local java
-  java="$(find_java "$mc" "fabric")" || die "java not found in PATH/JAVA_HOME (required to install Fabric)."
+  java="$(find_java)" || die "java not found in PATH/JAVA_HOME (required to install Fabric)."
   export PATH="$(dirname "$java"):$PATH"
   export JAVA_HOME="$(dirname "$(dirname "$java")")"
 
