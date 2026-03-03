@@ -135,6 +135,88 @@ fi
 chmod +x ./*.sh 2>/dev/null || true
 
 
+
+# -----------------------------
+# Download mods listed in CurseForge manifest.json (client packs)
+# Requires CF_API_KEY. This is needed when the pack is NOT a server pack:
+# the zip often contains only overrides + manifest, and mods must be fetched.
+# -----------------------------
+download_mods_from_manifest_if_needed() {
+  [[ -f "./manifest.json" ]] || return 0
+
+  # If mods folder already has jars, assume we're good
+  if [[ -d "./mods" ]] && find ./mods -maxdepth 1 -type f -name "*.jar" -print -quit | grep -q .; then
+    debug "mods/ already populated; skipping manifest mod download."
+    return 0
+  fi
+
+  # Parse file IDs from manifest
+  local file_ids
+  file_ids="$(python3 - <<'PY' 2>/dev/null || true
+import json
+try:
+  m=json.load(open("manifest.json","r",encoding="utf-8"))
+  files=m.get("files") or []
+  ids=[str(f.get("fileID")) for f in files if f.get("fileID")]
+  print("\n".join(ids))
+except Exception:
+  pass
+PY
+)"
+  [[ -n "$file_ids" ]] || { debug "No fileIDs in manifest.json; skipping mod download."; return 0; }
+
+  need CF_API_KEY
+
+  mkdir -p ./mods
+  mkdir -p .bb_tmp_mods
+  echo "[curseforge] manifest: downloading $(echo "$file_ids" | wc -l | tr -d ' ') mods into ./mods ..."
+
+  local id url out
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    echo "[curseforge] manifest: resolving download url for file $id..."
+    url="$(curl -fsSL \
+      -H "x-api-key: ${CF_API_KEY}" \
+      "https://api.curseforge.com/v1/mods/files/${id}/download-url" \
+      | python3 - <<'PY' 2>/dev/null || true
+import sys, json
+try:
+  data=json.load(sys.stdin)
+  print((data.get("data") or "").strip())
+except Exception:
+  pass
+PY
+)"
+    if [[ -z "$url" ]]; then
+      echo "[curseforge] WARNING: could not resolve download url for file $id (skipping)" >&2
+      continue
+    fi
+
+    # Keep filename from URL
+    out=".bb_tmp_mods/$(basename "${url%%\?*}")"
+    echo "[curseforge] manifest: downloading $(basename "$out")"
+    curl -fL --retry 3 --retry-delay 1 "$url" -o "$out"
+
+  done <<<"$file_ids"
+
+  # Move into mods/
+  shopt -s nullglob
+  local moved=0
+  for f in .bb_tmp_mods/*.jar; do
+    mv -f "$f" ./mods/
+    moved=$((moved+1))
+  done
+  shopt -u nullglob
+  rm -rf .bb_tmp_mods
+
+  if [[ "$moved" -gt 0 ]]; then
+    echo "[curseforge] manifest: downloaded ${moved} mod jars."
+  else
+    echo "[curseforge] WARNING: manifest mod download produced 0 jars. The pack may require a server pack, or API access may be blocked." >&2
+  fi
+}
+
+
 # -----------------------------
 # If this wasn't a real server pack, attempt manifest-mode bootstrap so the result is runnable.
 # This supports most modern CurseForge packs (Forge/Fabric/NeoForge/Quilt) that ship only a client zip.
@@ -244,6 +326,8 @@ bootstrap_from_manifest_if_needed() {
       ;;
   esac
 }
+
+download_mods_from_manifest_if_needed
 
 bootstrap_from_manifest_if_needed
 
