@@ -547,9 +547,25 @@ fix_legacy_forge_jar_reference() {
   [[ -f "$script" ]] || return 0
 
   # Find a forge jar reference like: forge-1.12.2-14.23.5.2860.jar
-  local want
-  want="$(grep -Eo 'forge-[^"\x27[:space:]]+\.jar' "$script" | head -n 1 || true)"
-  [[ -n "${want:-}" ]] || return 0
+local want
+want="$(grep -Eo 'forge-[^"\x27[:space:]]+\.jar' "$script" | head -n 1 || true)"
+
+# Some packs (SkyFactory 4) build the jar name via variables; if we didn't match a literal,
+# fall back to any forge-*-universal.jar we can find and create the expected non-universal alias.
+if [[ -z "${want:-}" ]]; then
+  local uni_any bn
+  uni_any="$(find . -maxdepth 3 -type f -name 'forge-*-universal.jar' 2>/dev/null | head -n 1 || true)"
+  if [[ -n "${uni_any:-}" ]]; then
+    bn="${uni_any##*/}"
+    want="${bn/-universal.jar/.jar}"
+    # Ensure the universal jar is accessible from cwd under its basename
+    if [[ "$uni_any" != "./$bn" && ! -f "./$bn" ]]; then
+      ln -sf "$uni_any" "./$bn" 2>/dev/null || cp -f "$uni_any" "./$bn" || true
+    fi
+  fi
+fi
+
+[[ -n "${want:-}" ]] || return 0
 
   if [[ -f "$want" ]]; then
     return 0

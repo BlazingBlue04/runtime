@@ -162,15 +162,29 @@ have_runnable() {
 parse_manifest() {
   [[ -f manifest.json ]] || return 1
   local mc loader_id
-  # Prefer jq, but fall back to python (some yolks don't ship jq)
+  # Prefer jq, but fall back to python3 (some yolks don't ship jq)
   if command -v jq >/dev/null 2>&1; then
     mc="$(jq -r '.minecraft.version // empty' manifest.json)"
     loader_id="$(jq -r '.minecraft.modLoaders[]? | select(.primary==true) | .id // empty' manifest.json)"
     [[ -n "$loader_id" ]] || loader_id="$(jq -r '.minecraft.modLoaders[0].id // empty' manifest.json)"
   else
-    # No jq/python available: best-effort JSON extraction with awk/grep
-    mc="$(awk 'f && /"version"/{match($0,/"version"[[:space:]]*:[[:space:]]*\"([^\"]+)\"/,a); if(a[1]){print a[1]; exit}} /"minecraft"[[:space:]]*:/{f=1}' manifest.json 2>/dev/null || true)"
-    loader_id="$(grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' manifest.json 2>/dev/null | cut -d'"' -f4 | grep -m1 -E '^(forge|fabric|quilt|neoforge)-' || true)"
+    read -r mc loader_id < <(python3 - <<'PY' 2>/dev/null || true
+import json
+try:
+  m=json.load(open("manifest.json","r",encoding="utf-8"))
+  mc=(m.get("minecraft") or {}).get("version") or ""
+  loaders=(m.get("minecraft") or {}).get("modLoaders") or []
+  lid=""
+  for it in loaders:
+    if isinstance(it,dict) and it.get("primary") is True and it.get("id"):
+      lid=str(it["id"]); break
+  if not lid and loaders and isinstance(loaders[0],dict):
+    lid=str(loaders[0].get("id") or "")
+  print(mc.strip(), lid.strip())
+except Exception:
+  pass
+PY
+)
   fi
   [[ -n "${mc:-}" && -n "${loader_id:-}" ]] || return 1
   echo "$mc" "$loader_id"
@@ -232,6 +246,7 @@ SH
 }
 
 
+
 download_mods_from_manifest_if_needed() {
   # If the pack zip is a client pack, overrides/ may not include any mods.
   # In that case, manifest.json contains the mod list (projectID + fileID).
@@ -251,9 +266,7 @@ download_mods_from_manifest_if_needed() {
   mkdir -p "./mods"
   echo "[curseforge] manifest: mods/ is empty; downloading mod jars listed in manifest.json..."
 
-  # Extract (projectID,fileID) pairs
   # Extract (projectID,fileID) pairs (bash-only; no python/jq dependency)
-  # We assume manifest entries keep projectID/fileID order per object (CurseForge manifests do).
   : > .bb_manifest_mods.txt
   local _pids _fids
   _pids="$(mktemp)"; _fids="$(mktemp)"
@@ -275,5 +288,40 @@ download_mods_from_manifest_if_needed() {
     local api="https://api.curseforge.com/v1/mods/${pid}/files/${fid}/download-url"
     local resp url
     resp="$(curl -fsSL -H "x-api-key: ${CF_API_KEY}" -H "Accept: application/json" "$api" || true)"
+
     # Extract downloadUrl without jq/python
-    url="$(printf '%s' "$resp" | grep -oE '"downloadUrl"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4)"
+    # Response format: {"data":"https://..."}
+    url="$(printf '%s' "$resp" | grep -oE '"data"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4)"
+
+    if [[ -z "${url:-}" ]]; then
+      echo "[curseforge] manifest: (${i}/${total}) pid=${pid} fid=${fid} -> FAILED (no download url)"
+      fail=$((fail+1))
+      continue
+    fi
+
+    local fname
+    fname="$(basename "${url%%\?*}")"
+    # Avoid re-download if already present
+    if [[ -f "./mods/${fname}" ]]; then
+      ok=$((ok+1))
+      continue
+    fi
+
+    if curl -fL --retry 3 --retry-delay 1 -A "Mozilla/5.0" "$url" -o "./mods/${fname}"; then
+      ok=$((ok+1))
+    else
+      echo "[curseforge] manifest: (${i}/${total}) ${fname} -> FAILED download"
+      rm -f "./mods/${fname}" 2>/dev/null || true
+      fail=$((fail+1))
+    fi
+
+    # Light progress
+    if (( i % 25 == 0 )); then
+      echo "[curseforge] manifest: progress ${i}/${total} (ok=${ok} fail=${fail})"
+    fi
+  done < .bb_manifest_mods.txt
+
+  echo "[curseforge] manifest: complete (ok=${ok} fail=${fail})"
+  rm -f .bb_manifest_mods.txt 2>/dev/null || true
+}
+
