@@ -216,70 +216,6 @@ EOF
   export PATH="$shim_dir:$PATH"
 }
 
-
-# -----------------------------
-# Start-script hardening
-# - Disable "Restarting automatically in 10 seconds" loops
-# - Fix legacy Forge serverpacks that reference a missing forge-*.jar (e.g., SkyFactory 4)
-# -----------------------------
-disable_restart_loop_in_script() {
-  local f="$1"
-  [[ -f "$f" ]] || return 0
-  if grep -qi "Restarting automatically in 10 seconds" "$f"; then
-    log "Patching auto-restart loop in $f (disabling restart)..."
-    # Replace the message (keep it informative)
-    sed -i 's/Restarting automatically in 10 seconds.*/Server exited; auto-restart disabled by egg./I' "$f" 2>/dev/null || true
-    # Kill common sleep/read delays used for restart loops
-    sed -i -E 's/^[[:space:]]*sleep[[:space:]]+10[[:space:]]*$/exit 1/I' "$f" 2>/dev/null || true
-    sed -i -E 's/^[[:space:]]*read[[:space:]]+-t[[:space:]]+10.*$/exit 1/I' "$f" 2>/dev/null || true
-  fi
-}
-
-ensure_legacy_forge_jar_for_serverstart() {
-  local script="$1"
-  [[ -f "$script" ]] || return 0
-  [[ "$(basename "$script")" == "ServerStart.sh" ]] || return 0
-
-  # Look for "forge-<mc>-<forge>.jar" in the script
-  local want
-  want="$(grep -Eo 'forge-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.jar' "$script" | head -n 1 || true)"
-  [[ -n "$want" ]] || return 0
-
-  if [[ -f "./$want" ]]; then
-    debug "ServerStart.sh expects $want and it exists."
-    return 0
-  fi
-
-  log "ServerStart.sh expects $want but it is missing; attempting Forge legacy install..."
-
-  local base="${want%.jar}"              # forge-1.12.2-14.23.5.2860
-  local mc="${base#forge-}"; mc="${mc%%-*}"   # 1.12.2
-  local fv="${base#forge-${mc}-}"             # 14.23.5.2860
-
-  local installer="forge-${mc}-${fv}-installer.jar"
-  if [[ ! -f "./$installer" ]]; then
-    local url="https://maven.minecraftforge.net/net/minecraftforge/forge/${mc}-${fv}/${installer}"
-    log "Downloading Forge installer: $url"
-    curl -fL --retry 3 --retry-delay 1 "$url" -o "./$installer"
-  fi
-
-  log "Running Forge installer (legacy): $installer"
-  "$JAVA" -jar "./$installer" --installServer
-
-  # Forge 1.12.2 typically produces forge-...-universal.jar
-  local produced=""
-  for cand in "forge-${mc}-${fv}-universal.jar" "forge-${mc}-${fv}.jar"; do
-    if [[ -f "./$cand" ]]; then produced="$cand"; break; fi
-  done
-
-  if [[ -n "$produced" ]]; then
-    log "Creating expected jar name: $want -> $produced"
-    ln -sf "$produced" "$want" 2>/dev/null || cp -f "$produced" "$want"
-  else
-    log "WARN: Forge installer ran but did not produce a recognizable forge jar."
-  fi
-}
-
 # -----------------------------
 # Inputs (accept common aliases)
 # -----------------------------
@@ -568,6 +504,110 @@ find_start_candidate() {
   return 1
 }
 
+
+# -----------------------------
+# Start-script preflight fixes
+#  - disable auto-restart loops (ATM-style wrappers)
+#  - fix legacy ServerStart.sh expecting forge-*.jar without -universal suffix (SkyFactory 4)
+# -----------------------------
+disable_restart_loops_in_scripts() {
+  local changed=0
+  local pats=('Restarting automatically in 10 seconds' 'restarting automatically in 10 seconds' 'Automatically restarting in 10 seconds')
+  shopt -s nullglob
+  for f in ./*.sh; do
+    [[ -f "$f" ]] || continue
+    local hit=0
+    for p in "${pats[@]}"; do
+      if grep -Fq "$p" "$f"; then hit=1; break; fi
+    done
+    [[ "$hit" == "1" ]] || continue
+
+    # Patch: replace the restart message and force exit instead of sleeping/looping.
+    # This is intentionally heavy-handed: if the wrapper wants to restart, we stop.
+    sed -i \
+      -e 's/Restarting automatically in 10 seconds.*/Auto-restart disabled by BlazingBlue egg; exiting./' \
+      -e 's/restarting automatically in 10 seconds.*/Auto-restart disabled by BlazingBlue egg; exiting./' \
+      -e 's/Automatically restarting in 10 seconds.*/Auto-restart disabled by BlazingBlue egg; exiting./' \
+      -e 's/sleep[[:space:]]\+10/exit 1/g' \
+      -e 's/read[[:space:]]\+-t[[:space:]]\+10.*/exit 1/g' \
+      "$f" 2>/dev/null || true
+    chmod +x "$f" 2>/dev/null || true
+    changed=1
+  done
+  shopt -u nullglob
+  [[ "$changed" == "1" ]] && log "Patched auto-restart wrapper(s) in root scripts."
+}
+
+fix_legacy_forge_jar_reference() {
+  local script="$1"
+  [[ -f "$script" ]] || return 0
+
+  # Find a forge jar reference like: forge-1.12.2-14.23.5.2860.jar
+  local want
+  want="$(grep -Eo 'forge-[0-9.]+-[0-9.]+\.jar' "$script" | head -n 1 || true)"
+  [[ -n "${want:-}" ]] || return 0
+
+  if [[ -f "$want" ]]; then
+    return 0
+  fi
+
+  local base="${want%.jar}"
+  local uni="${base}-universal.jar"
+  local srv="${base}-server.jar"
+
+  if [[ -f "$uni" ]]; then
+    ln -sf "$uni" "$want" 2>/dev/null || cp -f "$uni" "$want"
+    log "Fixed legacy Forge jar name: $want -> $uni"
+    return 0
+  fi
+  if [[ -f "$srv" ]]; then
+    ln -sf "$srv" "$want" 2>/dev/null || cp -f "$srv" "$want"
+    log "Fixed legacy Forge jar name: $want -> $srv"
+    return 0
+  fi
+
+  # If no jar exists, try installing Forge server using the installer from Forge Maven
+  local fv="${base#forge-}"  # 1.12.2-14.23.5.2860
+  local inst="forge-${fv}-installer.jar"
+  local url="https://maven.minecraftforge.net/net/minecraftforge/forge/${fv}/${inst}"
+
+  log "Legacy Forge jar missing ($want). Attempting Forge installServer for ${fv}..."
+  curl -fL --retry 3 --retry-delay 1 "$url" -o "$inst"
+  "$JAVA_BIN" -jar "$inst" --installServer
+
+  # After install, universal jar usually exists
+  if [[ -f "$uni" ]]; then
+    ln -sf "$uni" "$want" 2>/dev/null || cp -f "$uni" "$want"
+    log "Forge installServer produced $uni; linked to $want"
+    return 0
+  fi
+
+  # Try to find any forge universal jar that matches the version
+  local found
+  found="$(ls -1 forge-${fv}-universal.jar 2>/dev/null | head -n 1 || true)"
+  if [[ -n "${found:-}" && -f "$found" ]]; then
+    ln -sf "$found" "$want" 2>/dev/null || cp -f "$found" "$want"
+    log "Linked $want -> $found"
+    return 0
+  fi
+
+  err "Forge install attempted but still cannot find ${want} (or ${uni})."
+  return 0
+}
+
+preflight_start_script() {
+  local script="$1"
+  [[ -f "$script" ]] || return 0
+  sed -i 's/\r$//' "$script" 2>/dev/null || true
+  chmod +x "$script" 2>/dev/null || true
+
+  # Apply global wrapper patches first
+  disable_restart_loops_in_scripts
+
+  # Specific legacy Forge fix (SkyFactory 4 and similar 1.12 packs)
+  fix_legacy_forge_jar_reference "$script"
+}
+
 run_start_candidate() {
   local cand="$1"
   # Ensure EULA is accepted even if pack changes working directory
@@ -580,16 +620,16 @@ run_start_candidate() {
       local inst="${cand#FORGE_INSTALLER::}"
       log "Found Forge installer: $inst -> running --installServer"
       # java wrapper already in PATH, and MAX_RAM/MIN_RAM exported
-      "$JAVA" -jar "$inst" --installServer || true
+      "$JAVA_BIN" -jar "$inst" --installServer || true
       ;;
     FORGE_ARGS::* )
       local unix_args="${cand#FORGE_ARGS::}"
       log "Starting Forge via unix_args.txt: $unix_args"
       # typical layout also includes user_jvm_args.txt at root; optional
       if [[ -f ./user_jvm_args.txt ]]; then
-        exec "$JAVA" @./user_jvm_args.txt @"$unix_args" nogui
+        exec "$JAVA_BIN" @./user_jvm_args.txt @"$unix_args" nogui
       else
-        exec "$JAVA" @"$unix_args" nogui
+        exec "$JAVA_BIN" @"$unix_args" nogui
       fi
       ;;
     JAR::* )
@@ -609,12 +649,11 @@ run_start_candidate() {
         exit 1
       fi
       log "Starting via jar: $jar"
-      exec "$JAVA" -jar "$jar" nogui
+      exec "$JAVA_BIN" -jar "$jar" nogui
       ;;
     * )
       log "Starting via script: $cand"
-      disable_restart_loop_in_script "$cand"
-      ensure_legacy_forge_jar_for_serverstart "$cand"
+      preflight_start_script "$cand"
       exec bash "$cand"
       ;;
   esac
@@ -854,21 +893,21 @@ start_server() {
         uni="$(find . -maxdepth 3 -type f -name 'forge-*-universal*.jar' 2>/dev/null | head -n 1 || true)"
         if [[ -n "$uni" ]]; then
           log "Starting via Forge universal jar: $uni"
-          exec "$JAVA" -jar "$uni" nogui
+          exec "$JAVA_BIN" -jar "$uni" nogui
         fi
 
         local fsj=""
         fsj="$(find . -maxdepth 2 -type f -name 'forge-*.jar' 2>/dev/null | grep -vi 'installer' | head -n 1 || true)"
         if [[ -n "$fsj" ]]; then
           log "Starting via Forge server jar: $fsj"
-          exec "$JAVA" -jar "$fsj" nogui
+          exec "$JAVA_BIN" -jar "$fsj" nogui
         fi
 
         local fsj
         fsj="$(find . -maxdepth 2 -type f -name 'forge-*.jar' 2>/dev/null | grep -vi 'installer' | head -n 1 || true)"
         if [[ -n "$fsj" ]]; then
           log "Starting via Forge server jar: $fsj"
-          exec "$JAVA" -jar "$fsj" nogui
+          exec "$JAVA_BIN" -jar "$fsj" nogui
         fi
 
         cand="$(find_start_candidate || true)"
@@ -882,7 +921,7 @@ start_server() {
         uni="$(find . -maxdepth 2 -type f -name 'forge-*-universal*.jar' 2>/dev/null | head -n 1 || true)"
         if [[ -n "$uni" ]]; then
           log "Starting via Forge universal jar: $uni"
-          exec "$JAVA" -jar "$uni" nogui
+          exec "$JAVA_BIN" -jar "$uni" nogui
         fi
 
         err "Forge installer finished but no runnable start method was produced."
