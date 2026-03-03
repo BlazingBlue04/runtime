@@ -512,27 +512,31 @@ find_start_candidate() {
 # -----------------------------
 disable_restart_loops_in_scripts() {
   local changed=0
-  local pats=('Restarting automatically in 10 seconds' 'restarting automatically in 10 seconds' 'Automatically restarting in 10 seconds')
   shopt -s nullglob
-  for f in ./*.sh; do
+  for f in ./*.sh ./*.command; do
     [[ -f "$f" ]] || continue
-    local hit=0
-    for p in "${pats[@]}"; do
-      if grep -Fq "$p" "$f"; then hit=1; break; fi
-    done
-    [[ "$hit" == "1" ]] || continue
 
-    # Patch: replace the restart message and force exit instead of sleeping/looping.
-    # This is intentionally heavy-handed: if the wrapper wants to restart, we stop.
-    sed -i \
-      -e 's/Restarting automatically in 10 seconds.*/Auto-restart disabled by BlazingBlue egg; exiting./' \
-      -e 's/restarting automatically in 10 seconds.*/Auto-restart disabled by BlazingBlue egg; exiting./' \
-      -e 's/Automatically restarting in 10 seconds.*/Auto-restart disabled by BlazingBlue egg; exiting./' \
-      -e 's/sleep[[:space:]]\+10/exit 1/g' \
-      -e 's/read[[:space:]]\+-t[[:space:]]\+10.*/exit 1/g' \
-      "$f" 2>/dev/null || true
-    chmod +x "$f" 2>/dev/null || true
-    changed=1
+    # Only patch scripts that look like crash-restart wrappers
+    if grep -qiE 'Restarting automatically in 10 seconds|press Ctrl \+ C to cancel|Auto[- ]?restart' "$f"; then
+      # Normalize CRLF and ensure executable
+      sed -i 's/
+$//' "$f" 2>/dev/null || true
+      chmod +x "$f" 2>/dev/null || true
+
+      # Kill common restart mechanisms (sleep/read countdown + while/for loops that relaunch)
+      # We don't try to perfectly parse bash; we just make the wrapper exit instead of sleeping/restarting.
+      sed -i \
+        -e 's/Restarting automatically in 10 seconds.*/Auto-restart disabled by egg; exiting on crash./I' \
+        -e 's/Automatically restarting in 10 seconds.*/Auto-restart disabled by egg; exiting on crash./I' \
+        -e 's/restarting automatically in 10 seconds.*/Auto-restart disabled by egg; exiting on crash./I' \
+        -e 's/press Ctrl \+ C to cancel.*/Auto-restart disabled by egg./I' \
+        -e 's/\<sleep[[:space:]]\+10\>/exit 1 # auto-restart disabled/I' \
+        -e 's/\<read[[:space:]]\+-t[[:space:]]\+10[^
+]*\>/exit 1 # auto-restart disabled/I' \
+        "$f" 2>/dev/null || true
+
+      changed=1
+    fi
   done
   shopt -u nullglob
   [[ "$changed" == "1" ]] && log "Patched auto-restart wrapper(s) in root scripts."
@@ -544,7 +548,7 @@ fix_legacy_forge_jar_reference() {
 
   # Find a forge jar reference like: forge-1.12.2-14.23.5.2860.jar
   local want
-  want="$(grep -Eo 'forge-[0-9.]+-[0-9.]+\.jar' "$script" | head -n 1 || true)"
+  want="$(grep -Eo 'forge-[^"\x27[:space:]]+\.jar' "$script" | head -n 1 || true)"
   [[ -n "${want:-}" ]] || return 0
 
   if [[ -f "$want" ]]; then
@@ -574,6 +578,15 @@ fix_legacy_forge_jar_reference() {
   log "Legacy Forge jar missing ($want). Attempting Forge installServer for ${fv}..."
   curl -fL --retry 3 --retry-delay 1 "$url" -o "$inst"
   "$JAVA_BIN" -jar "$inst" --installServer
+  # Some packs/placeholders drop output in subdirs; search a bit.
+  if [[ ! -f "$uni" ]]; then
+    local found_any
+    found_any="$(find . -maxdepth 3 -type f -name "${base}-universal.jar" -o -name "forge-${fv}-universal.jar" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${found_any:-}" && -f "$found_any" ]]; then
+      # Link into cwd where ServerStart.sh expects it
+      ln -sf "$found_any" "$uni" 2>/dev/null || cp -f "$found_any" "$uni" || true
+    fi
+  fi
 
   # After install, universal jar usually exists
   if [[ -f "$uni" ]]; then
@@ -620,7 +633,16 @@ run_start_candidate() {
       local inst="${cand#FORGE_INSTALLER::}"
       log "Found Forge installer: $inst -> running --installServer"
       # java wrapper already in PATH, and MAX_RAM/MIN_RAM exported
-      "$JAVA_BIN" -jar "$inst" --installServer || true
+      "$JAVA_BIN" -jar "$inst" --installServer
+  # Some packs/placeholders drop output in subdirs; search a bit.
+  if [[ ! -f "$uni" ]]; then
+    local found_any
+    found_any="$(find . -maxdepth 3 -type f -name "${base}-universal.jar" -o -name "forge-${fv}-universal.jar" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${found_any:-}" && -f "$found_any" ]]; then
+      # Link into cwd where ServerStart.sh expects it
+      ln -sf "$found_any" "$uni" 2>/dev/null || cp -f "$found_any" "$uni" || true
+    fi
+  fi
       ;;
     FORGE_ARGS::* )
       local unix_args="${cand#FORGE_ARGS::}"
@@ -637,7 +659,7 @@ run_start_candidate() {
       # Forge installer jars must be run in headless installServer mode, not as a GUI.
       if [[ "$jar" == *"-installer.jar" ]]; then
         log "Found Forge installer jar: $jar -> running --installServer (headless)"
-        java -Djava.awt.headless=true -jar "$jar" --installServer || true
+        "$JAVA_BIN" -Djava.awt.headless=true -jar "$jar" --installServer
         # After install, try to discover the actual start candidate again.
         local next
         next="$(find_start_candidate || true)"
