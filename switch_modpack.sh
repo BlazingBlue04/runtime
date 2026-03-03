@@ -656,13 +656,27 @@ bootstrap_forge_from_manifest() {
 
   log "[switch] Manifest detected: mc=$mc loader=$loader ver=$ver"
 
+  local JAVA
+  JAVA="$(java_for "$mc" "$loader")" || return 1
+  # Ensure 'java' is available for any generated scripts
+  export PATH="$(dirname "$JAVA"):$PATH"
+  export JAVA_HOME="$(dirname "$(dirname "$JAVA")")"
+
   local inst
   inst="$(download_forge_installer "$mc" "$ver")" || return 1
 
-  log "[switch] Running Forge installer --installServer..."
-  java -jar "$inst" --installServer || true
+  log "[switch] Running Forge installer --installServer with $JAVA ..."
+  if ! "$JAVA" -Djava.awt.headless=true -jar "$inst" --installServer; then
+    warn "Forge installer failed."
+    return 1
+  fi
 
-  return 0
+  # Validate that something runnable was produced
+  if [[ -f "./run.sh" || -f "./start.sh" || -d "./libraries" ]]; then
+    return 0
+  fi
+  warn "Forge installer completed but produced no runnable artifacts (no run.sh/start.sh/libraries)."
+  return 1
 }
 
 

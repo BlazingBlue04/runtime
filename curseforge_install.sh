@@ -135,6 +135,119 @@ fi
 chmod +x ./*.sh 2>/dev/null || true
 
 
+# -----------------------------
+# If this wasn't a real server pack, attempt manifest-mode bootstrap so the result is runnable.
+# This supports most modern CurseForge packs (Forge/Fabric/NeoForge/Quilt) that ship only a client zip.
+# Env:
+#   JAVA_BIN (optional) explicit java path
+# -----------------------------
+find_java() {
+  if [[ -n "${JAVA_BIN:-}" && -x "${JAVA_BIN}" ]]; then echo "${JAVA_BIN}"; return 0; fi
+  if [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/java" ]]; then echo "${JAVA_HOME}/bin/java"; return 0; fi
+  if command -v java >/dev/null 2>&1; then command -v java; return 0; fi
+  # Common Pterodactyl yolk paths
+  for p in /opt/java/*/bin/java /usr/lib/jvm/*/bin/java; do
+    if [[ -x "$p" ]]; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+
+have_runnable() {
+  [[ -f "./run.sh" || -f "./start.sh" || -f "./LaunchServer.sh" ]] && return 0
+  [[ -f "./server.jar" ]] && return 0
+  [[ -d "./libraries" ]] && return 0
+  return 1
+}
+
+parse_manifest() {
+  [[ -f manifest.json ]] || return 1
+  local mc loader_id
+  mc="$(jq -r '.minecraft.version // empty' manifest.json)"
+  loader_id="$(jq -r '.minecraft.modLoaders[]? | select(.primary==true) | .id // empty' manifest.json)"
+  [[ -n "$loader_id" ]] || loader_id="$(jq -r '.minecraft.modLoaders[0].id // empty' manifest.json)"
+  [[ -n "$mc" && -n "$loader_id" ]] || return 1
+  echo "$mc" "$loader_id"
+}
+
+forge_install() {
+  local mc="$1" forge_ver="$2"
+  local java
+  java="$(find_java)" || die "java not found in PATH/JAVA_HOME (required to install Forge)."
+  export PATH="$(dirname "$java"):$PATH"
+  export JAVA_HOME="$(dirname "$(dirname "$java")")"
+
+  local url="https://maven.minecraftforge.net/net/minecraftforge/forge/${mc}-${forge_ver}/forge-${mc}-${forge_ver}-installer.jar"
+  echo "[curseforge] Installing Forge server: ${mc}-${forge_ver}"
+  rm -f forge-installer.jar
+  wget -qO forge-installer.jar "$url" || die "Failed to download Forge installer: $url"
+  "$java" -Djava.awt.headless=true -jar forge-installer.jar --installServer || die "Forge installer failed."
+  rm -f forge-installer.jar
+
+  # Make a simple start.sh so the egg can always start something deterministic.
+  if [[ -f "./run.sh" ]]; then
+    cat > ./start.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+chmod +x ./run.sh 2>/dev/null || true
+exec bash ./run.sh
+SH
+    chmod +x ./start.sh || true
+  fi
+}
+
+fabric_install() {
+  local mc="$1" loader_ver="$2"
+  local java
+  java="$(find_java)" || die "java not found in PATH/JAVA_HOME (required to install Fabric)."
+  export PATH="$(dirname "$java"):$PATH"
+  export JAVA_HOME="$(dirname "$(dirname "$java")")"
+
+  # Fabric installer: https://maven.fabricmc.net/net/fabricmc/fabric-installer/
+  # Pin to a known-good recent installer if not provided.
+  local inst_ver="${FABRIC_INSTALLER_VERSION:-1.0.1}"
+  local url="https://maven.fabricmc.net/net/fabricmc/fabric-installer/${inst_ver}/fabric-installer-${inst_ver}.jar"
+  echo "[curseforge] Installing Fabric server: mc=${mc} loader=${loader_ver} installer=${inst_ver}"
+  rm -f fabric-installer.jar
+  wget -qO fabric-installer.jar "$url" || die "Failed to download Fabric installer: $url"
+  "$java" -Djava.awt.headless=true -jar fabric-installer.jar server -mcversion "$mc" -loader "$loader_ver" -downloadMinecraft || die "Fabric installer failed."
+  rm -f fabric-installer.jar
+
+  if [[ -f "./run.sh" ]]; then
+    cat > ./start.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+chmod +x ./run.sh 2>/dev/null || true
+exec bash ./run.sh
+SH
+    chmod +x ./start.sh || true
+  fi
+}
+
+bootstrap_from_manifest_if_needed() {
+  have_runnable && return 0
+  local mc loader_id loader kind ver
+  read -r mc loader_id < <(parse_manifest) || return 0
+
+  kind="${loader_id%%-*}"
+  ver="${loader_id#*-}"
+  [[ -n "$kind" && -n "$ver" && "$ver" != "$loader_id" ]] || return 0
+
+  echo "[curseforge] Pack is not a server pack and no runnable artifacts were found."
+  echo "[curseforge] Entering manifest-mode bootstrap..."
+  echo "[curseforge] manifest-mode: MC=${mc} Loader=${loader_id}"
+
+  case "$kind" in
+    forge) forge_install "$mc" "$ver" ;;
+    fabric) fabric_install "$mc" "$ver" ;;
+    *)
+      echo "[curseforge] manifest-mode: Loader '${kind}' not implemented in installer; leaving for switch_modpack.sh bootstrap."
+      ;;
+  esac
+}
+
+bootstrap_from_manifest_if_needed
+
+
 rm -rf .bb_tmp_unpack
 
 echo "[curseforge] Install completed."
