@@ -367,14 +367,52 @@ detect_mc_version() {
   if [[ -z "$v" ]] && has_glob "./forge-*.jar"; then
     v="$(ls -1 ./forge-*.jar 2>/dev/null | head -n1 | sed -E 's#./forge-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\1#')"
   fi
+
+  # CurseForge manifest fallback (works before loader bootstrap too)
+  if [[ -z "$v" ]] && [[ -f "./manifest.json" ]]; then
+    v="$(python3 - <<'PY' 2>/dev/null || true
+import json
+try:
+  m=json.load(open("manifest.json","r",encoding="utf-8"))
+  mc=(m.get("minecraft") or {}).get("version") or ""
+  print(str(mc).strip())
+except Exception:
+  pass
+PY
+)"
+  fi
+
   v="$(strip_mc "$v")"
   echo "${v:-<unknown>}"
 }
 
 detect_loader() {
+  # If already bootstrapped, infer from installed files
   if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then echo "neoforge"; return; fi
   if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then echo "forge"; return; fi
   if has_glob "./libraries/net/fabricmc/fabric-loader/*/fabric-loader-*.jar"; then echo "fabric"; return; fi
+  if has_glob "./libraries/org/quiltmc/quilt-loader/*/quilt-loader-*.jar"; then echo "quilt"; return; fi
+
+  # CurseForge manifest fallback (works before loader bootstrap too)
+  if [[ -f "./manifest.json" ]]; then
+    python3 - <<'PY' 2>/dev/null && exit 0 || true
+import json, sys
+try:
+  m=json.load(open("manifest.json","r",encoding="utf-8"))
+  loaders=(m.get("minecraft") or {}).get("modLoaders") or []
+  ids=[(x.get("id") or "").lower() for x in loaders if isinstance(x, dict)]
+  # prioritize neoforge > forge > fabric > quilt
+  if any(i.startswith("neoforge") for i in ids): print("neoforge"); sys.exit(0)
+  if any(i.startswith("forge") for i in ids): print("forge"); sys.exit(0)
+  if any(i.startswith("fabric") for i in ids): print("fabric"); sys.exit(0)
+  if any(i.startswith("quilt") for i in ids): print("quilt"); sys.exit(0)
+except Exception:
+  pass
+print("<unknown>")
+PY
+    return
+  fi
+
   echo "<unknown>"
 }
 
@@ -385,26 +423,41 @@ java_for() {
   local mc="$1"
   local loader="$2"
 
+  # NeoForge generally targets Java 21 for modern MC
   if [[ "$loader" == "neoforge" ]]; then
     echo "/opt/java/21/bin/java"; return
   fi
 
-  # If unknown, default to 21 (most modern); start scripts often override args anyway.
+  # If unknown, prefer Java 17 as safest default for most packs (1.18–1.20.4)
   if [[ "$mc" == "<unknown>" ]]; then
-    echo "/opt/java/21/bin/java"; return
+    if [[ -x "/opt/java/17/bin/java" ]]; then echo "/opt/java/17/bin/java"; return; fi
+    if [[ -x "/opt/java/21/bin/java" ]]; then echo "/opt/java/21/bin/java"; return; fi
+    echo "java"; return
   fi
 
-  # Very old packs (1.12.2 and earlier) MUST use Java 8 (LaunchWrapper breaks on Java 9+)
-  if [[ "$mc" =~ ^1\.([0-9]+) ]]; then
+  if [[ "$mc" =~ ^1\.([0-9]+)(\.[0-9]+)? ]]; then
     local minor="${BASH_REMATCH[1]}"
-    if (( minor <= 12 )); then echo "/opt/java/8/bin/java"; return; fi
+
+    # 1.16 and older -> Java 8
     if (( minor <= 16 )); then echo "/opt/java/8/bin/java"; return; fi
+
+    # 1.17 -> Java 16 (fallback 17)
+    if (( minor == 17 )); then
+      if [[ -x "/opt/java/16/bin/java" ]]; then echo "/opt/java/16/bin/java"; return; fi
+      echo "/opt/java/17/bin/java"; return
+    fi
+
+    # 1.18–1.20 -> Java 17 (covers 1.20.1)
     if (( minor <= 20 )); then echo "/opt/java/17/bin/java"; return; fi
-    # 1.21+
+
+    # 1.21+ -> Java 21
     echo "/opt/java/21/bin/java"; return
   fi
 
-  echo "/opt/java/21/bin/java"
+  # fallback
+  if [[ -x "/opt/java/17/bin/java" ]]; then echo "/opt/java/17/bin/java"; return; fi
+  if [[ -x "/opt/java/21/bin/java" ]]; then echo "/opt/java/21/bin/java"; return; fi
+  echo "java"
 }
 
 # ---------------------------------------
@@ -713,6 +766,7 @@ start_server() {
   log "Detected MC version: $mc"
   log "Detected loader: $loader"
   force_java_override
+  export JAVA_BIN="$JAVA"
   log "Effective java: $JAVA"
   "$JAVA" -version || true
 
