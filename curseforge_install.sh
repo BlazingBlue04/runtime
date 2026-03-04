@@ -325,3 +325,42 @@ download_mods_from_manifest_if_needed() {
   rm -f .bb_manifest_mods.txt 2>/dev/null || true
 }
 
+# -----------------------------
+# Main execution: bootstrap if needed, then download mods if needed
+# -----------------------------
+
+# Run manifest-based bootstrap only if we don't already have runnable artifacts
+if ! have_runnable; then
+  echo "[curseforge] No runnable artifacts found; attempting manifest-based bootstrap..."
+  if mc_loader_pair="$(parse_manifest 2>/dev/null)"; then
+    mc="$(echo "$mc_loader_pair" | cut -d' ' -f1)"
+    loader_id="$(echo "$mc_loader_pair" | cut -d' ' -f2)"
+    loader="$(echo "$loader_id" | cut -d'-' -f1)"
+    loader_ver="$(echo "$loader_id" | cut -d'-' -f2-)"
+
+    echo "[curseforge] Manifest: mc=${mc} loader=${loader} ver=${loader_ver}"
+
+    case "$loader" in
+      forge|neoforge)
+        forge_install "$mc" "$loader_ver"
+        ;;
+      fabric)
+        fabric_install "$mc" "$loader_ver"
+        ;;
+      quilt)
+        # Quilt uses the same installer interface as Fabric
+        fabric_install "$mc" "$loader_ver"
+        ;;
+      *)
+        echo "[curseforge] WARN: Unsupported loader '${loader}' in manifest; skipping bootstrap."
+        ;;
+    esac
+  else
+    echo "[curseforge] WARN: manifest.json not found or unparseable; cannot bootstrap loader."
+  fi
+fi
+
+# Always attempt to fetch missing mods from manifest
+download_mods_from_manifest_if_needed
+
+echo "[curseforge] Install complete."

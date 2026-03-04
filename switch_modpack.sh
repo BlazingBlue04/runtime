@@ -516,24 +516,70 @@ disable_restart_loops_in_scripts() {
   for f in ./*.sh ./*.command; do
     [[ -f "$f" ]] || continue
 
-    # Only patch scripts that look like crash-restart wrappers
-    if grep -qiE 'Restarting automatically in 10 seconds|press Ctrl \+ C to cancel|Auto[- ]?restart' "$f"; then
+    # Detect restart-wrapper scripts broadly:
+    #  - classic countdown phrases
+    #  - while true / while : / while [ 1 ] loops that re-exec the server
+    #  - ATM/AllTheMods-style wrappers
+    if grep -qiE \
+      'Restarting automatically|press Ctrl \+ C to cancel|Auto[- ]?restart|while true|while \(true\)|while :( |$)|START_ON_CRASH|auto_restart|RESTART_ON_CRASH' \
+      "$f" 2>/dev/null; then
+
       # Normalize CRLF and ensure executable
-      sed -i 's/
-$//' "$f" 2>/dev/null || true
+      sed -i 's/\r$//' "$f" 2>/dev/null || true
       chmod +x "$f" 2>/dev/null || true
 
-      # Kill common restart mechanisms (sleep/read countdown + while/for loops that relaunch)
-      # We don't try to perfectly parse bash; we just make the wrapper exit instead of sleeping/restarting.
+      # 1) Replace the restart-countdown lines (echo + sleep + read -t)
       sed -i \
-        -e 's/Restarting automatically in 10 seconds.*/Auto-restart disabled by egg; exiting on crash./I' \
-        -e 's/Automatically restarting in 10 seconds.*/Auto-restart disabled by egg; exiting on crash./I' \
-        -e 's/restarting automatically in 10 seconds.*/Auto-restart disabled by egg; exiting on crash./I' \
+        -e 's/Restarting automatically in [0-9]* seconds.*/Auto-restart disabled by egg; exiting on crash./I' \
+        -e 's/Automatically restarting in [0-9]* seconds.*/Auto-restart disabled by egg; exiting on crash./I' \
         -e 's/press Ctrl \+ C to cancel.*/Auto-restart disabled by egg./I' \
-        -e 's/\<sleep[[:space:]]\+10\>/exit 1 # auto-restart disabled/I' \
-        -e 's/\<read[[:space:]]\+-t[[:space:]]\+10[^
-]*\>/exit 1 # auto-restart disabled/I' \
+        -e 's/\bsleep[[:space:]]\+[0-9]\+\b/true # sleep removed (auto-restart disabled)/I' \
+        -e 's/\bread[[:space:]]\+-t[[:space:]]\+[0-9]\+[^
+]*/true # read-timer removed (auto-restart disabled)/I' \
         "$f" 2>/dev/null || true
+
+      # 2) Convert  while true / while : / while (true)  loops that wrap the server launch.
+      #    Strategy: replace the while condition with `if false` so the block runs 0 times,
+      #    then the `do ... done` tail falls through naturally.
+      #    We only do this when the loop body contains a java / server invocation keyword.
+      if grep -qiE 'while[[:space:]]+(true|:|1|\(true\))' "$f" 2>/dev/null; then
+        # Use python3 for reliable multi-line substitution (available in all Pterodactyl yolks)
+        python3 - "$f" <<'PY' 2>/dev/null && changed=1 || true
+import sys, re, os
+
+path = sys.argv[1]
+with open(path, "r", errors="replace") as fh:
+    src = fh.read()
+
+# Match: while true|:|1|(true) ... done blocks that contain server launch keywords
+# We replace the `while` header with a comment + single-run `if true` guard removed,
+# effectively making the block execute once and then fall through (no restart).
+LOOP_RE = re.compile(
+    r'(^[ \t]*)(while[ \t]+(?:true|\(true\)|:|1)[ \t]*(?:;[ \t*]*)?\n)(.*?)(^[ \t]*done\b)',
+    re.MULTILINE | re.DOTALL
+)
+
+SERVER_KEYWORDS = re.compile(r'\bjava\b|\bserver\.jar\b|forge-.*\.jar|fabric-server|run\.sh|StartServer|LaunchServer|nogui', re.IGNORECASE)
+
+def patch_loop(m):
+    indent, header, body, done = m.group(1), m.group(2), m.group(3), m.group(4)
+    if not SERVER_KEYWORDS.search(body):
+        return m.group(0)  # not a server loop; leave alone
+    # Replace with a one-shot block (no loop)
+    return (
+        indent + "# [egg] auto-restart loop disabled\n" +
+        indent + "# " + header.rstrip("\n") + "  # was: restart loop\n" +
+        body +
+        indent + "# done  # end of disabled restart loop\n"
+    )
+
+patched, n = LOOP_RE.subn(patch_loop, src)
+if n > 0:
+    with open(path, "w") as fh:
+        fh.write(patched)
+    print(f"[switch] Patched {n} restart loop(s) in {path}")
+PY
+      fi
 
       changed=1
     fi
@@ -878,7 +924,9 @@ start_server() {
   for s in "./run.sh" "./startserver.sh" "./LaunchServer.sh" "./ServerStart.sh" "./StartServer.sh"; do
     if [[ -f "$s" ]]; then
       log "Starting via script: $s"
-      mkdir -p .bb_tmp
+      # Apply preflight BEFORE sanitizing: fixes legacy Forge jar names (e.g. SkyFactory 4)
+      # and strips auto-restart loops before we exec the script.
+      preflight_start_script "$s"
       local tmp=".bb_tmp_start.sh"
       sanitize_start_script "$s" "$tmp"
       # Execute with bash to avoid "sh" incompatibilities
