@@ -606,8 +606,10 @@ if [[ -z "${want:-}" ]]; then
     want="${bn/-universal.jar/.jar}"
     # Ensure the universal jar is accessible from cwd under its basename
     if [[ "$uni_any" != "./$bn" && ! -f "./$bn" ]]; then
-      ln -sf "$uni_any" "./$bn" 2>/dev/null || cp -f "$uni_any" "./$bn" || true
+      ln -sf "$(realpath "$uni_any" 2>/dev/null || echo "$uni_any")" "./$bn" 2>/dev/null || cp -f "$uni_any" "./$bn" || true
     fi
+    # Also rewrite the script so it references the universal jar directly
+    sed -i "s|${want}|${bn}|g" "$script" 2>/dev/null || true
   fi
 fi
 
@@ -622,13 +624,24 @@ fi
   local srv="${base}-server.jar"
 
   if [[ -f "$uni" ]]; then
-    ln -sf "$uni" "$want" 2>/dev/null || cp -f "$uni" "$want"
+    # Try symlink first; if the symlink target isn't accessible (e.g. relative path issue), hard-copy
+    ln -sf "$(realpath "$uni" 2>/dev/null || echo "$uni")" "$want" 2>/dev/null || cp -f "$uni" "$want"
+    # Verify the result is actually accessible; fall back to hard copy if not
+    if [[ ! -f "$want" ]]; then
+      cp -f "$uni" "$want" || true
+    fi
     log "Fixed legacy Forge jar name: $want -> $uni"
+    # Also rewrite the reference inside the script itself so the sanitized copy picks it up
+    sed -i "s|${want}|${uni}|g" "$script" 2>/dev/null || true
     return 0
   fi
   if [[ -f "$srv" ]]; then
-    ln -sf "$srv" "$want" 2>/dev/null || cp -f "$srv" "$want"
+    ln -sf "$(realpath "$srv" 2>/dev/null || echo "$srv")" "$want" 2>/dev/null || cp -f "$srv" "$want"
+    if [[ ! -f "$want" ]]; then
+      cp -f "$srv" "$want" || true
+    fi
     log "Fixed legacy Forge jar name: $want -> $srv"
+    sed -i "s|${want}|${srv}|g" "$script" 2>/dev/null || true
     return 0
   fi
 
@@ -639,7 +652,7 @@ fi
 
   log "Legacy Forge jar missing ($want). Attempting Forge installServer for ${fv}..."
   curl -fL --retry 3 --retry-delay 1 "$url" -o "$inst"
-  "$JAVA_BIN" -jar "$inst" --installServer
+  "$JAVA" -jar "$inst" --installServer
   # Some packs/placeholders drop output in subdirs; search a bit.
   if [[ ! -f "$uni" ]]; then
     local found_any
@@ -695,7 +708,7 @@ run_start_candidate() {
       local inst="${cand#FORGE_INSTALLER::}"
       log "Found Forge installer: $inst -> running --installServer"
       # java wrapper already in PATH, and MAX_RAM/MIN_RAM exported
-      "$JAVA_BIN" -jar "$inst" --installServer
+      "$JAVA" -jar "$inst" --installServer
   # Some packs/placeholders drop output in subdirs; search a bit.
   if [[ ! -f "$uni" ]]; then
     local found_any
@@ -711,9 +724,9 @@ run_start_candidate() {
       log "Starting Forge via unix_args.txt: $unix_args"
       # typical layout also includes user_jvm_args.txt at root; optional
       if [[ -f ./user_jvm_args.txt ]]; then
-        exec "$JAVA_BIN" @./user_jvm_args.txt @"$unix_args" nogui
+        exec "$JAVA" @./user_jvm_args.txt @"$unix_args" nogui
       else
-        exec "$JAVA_BIN" @"$unix_args" nogui
+        exec "$JAVA" @"$unix_args" nogui
       fi
       ;;
     JAR::* )
@@ -721,7 +734,7 @@ run_start_candidate() {
       # Forge installer jars must be run in headless installServer mode, not as a GUI.
       if [[ "$jar" == *"-installer.jar" ]]; then
         log "Found Forge installer jar: $jar -> running --installServer (headless)"
-        "$JAVA_BIN" -Djava.awt.headless=true -jar "$jar" --installServer
+        "$JAVA" -Djava.awt.headless=true -jar "$jar" --installServer
         # After install, try to discover the actual start candidate again.
         local next
         next="$(find_start_candidate || true)"
@@ -733,7 +746,7 @@ run_start_candidate() {
         exit 1
       fi
       log "Starting via jar: $jar"
-      exec "$JAVA_BIN" -jar "$jar" nogui
+      exec "$JAVA" -jar "$jar" nogui
       ;;
     * )
       log "Starting via script: $cand"
@@ -979,21 +992,21 @@ start_server() {
         uni="$(find . -maxdepth 3 -type f -name 'forge-*-universal*.jar' 2>/dev/null | head -n 1 || true)"
         if [[ -n "$uni" ]]; then
           log "Starting via Forge universal jar: $uni"
-          exec "$JAVA_BIN" -jar "$uni" nogui
+          exec "$JAVA" -jar "$uni" nogui
         fi
 
         local fsj=""
         fsj="$(find . -maxdepth 2 -type f -name 'forge-*.jar' 2>/dev/null | grep -vi 'installer' | head -n 1 || true)"
         if [[ -n "$fsj" ]]; then
           log "Starting via Forge server jar: $fsj"
-          exec "$JAVA_BIN" -jar "$fsj" nogui
+          exec "$JAVA" -jar "$fsj" nogui
         fi
 
         local fsj
         fsj="$(find . -maxdepth 2 -type f -name 'forge-*.jar' 2>/dev/null | grep -vi 'installer' | head -n 1 || true)"
         if [[ -n "$fsj" ]]; then
           log "Starting via Forge server jar: $fsj"
-          exec "$JAVA_BIN" -jar "$fsj" nogui
+          exec "$JAVA" -jar "$fsj" nogui
         fi
 
         cand="$(find_start_candidate || true)"
@@ -1007,7 +1020,7 @@ start_server() {
         uni="$(find . -maxdepth 2 -type f -name 'forge-*-universal*.jar' 2>/dev/null | head -n 1 || true)"
         if [[ -n "$uni" ]]; then
           log "Starting via Forge universal jar: $uni"
-          exec "$JAVA_BIN" -jar "$uni" nogui
+          exec "$JAVA" -jar "$uni" nogui
         fi
 
         err "Forge installer finished but no runnable start method was produced."

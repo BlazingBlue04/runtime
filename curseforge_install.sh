@@ -290,13 +290,23 @@ download_mods_from_manifest_if_needed() {
     resp="$(curl -fsSL -H "x-api-key: ${CF_API_KEY}" -H "Accept: application/json" "$api" || true)"
 
     # Extract downloadUrl without jq/python
-    # Response format: {"data":"https://..."}
+    # Response format: {"data":"https://..."} or {"data":null} for restricted mods
     url="$(printf '%s' "$resp" | grep -oE '"data"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4)"
 
-    if [[ -z "${url:-}" ]]; then
-      echo "[curseforge] manifest: (${i}/${total}) pid=${pid} fid=${fid} -> FAILED (no download url)"
-      fail=$((fail+1))
-      continue
+    if [[ -z "${url:-}" || "$url" == "null" ]]; then
+      # Some mods block third-party distribution; try the CDN fallback pattern
+      local cdn_url="https://edge.forgecdn.net/files/${fid:0:4}/${fid:4}/$(
+        curl -fsSL -H "x-api-key: ${CF_API_KEY}" -H "Accept: application/json" \
+          "https://api.curseforge.com/v1/mods/${pid}/files/${fid}" 2>/dev/null \
+          | grep -oE '"fileName"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4
+      )"
+      if [[ "$cdn_url" =~ ^https:// ]]; then
+        url="$cdn_url"
+      else
+        echo "[curseforge] manifest: (${i}/${total}) pid=${pid} fid=${fid} -> SKIPPED (no download url; mod may block third-party distribution)"
+        fail=$((fail+1))
+        continue
+      fi
     fi
 
     local fname
@@ -307,10 +317,19 @@ download_mods_from_manifest_if_needed() {
       continue
     fi
 
-    if curl -fL --retry 3 --retry-delay 1 -A "Mozilla/5.0" "$url" -o "./mods/${fname}"; then
+    local http_code
+    http_code="$(curl -fL --retry 3 --retry-delay 1 -A "Mozilla/5.0" \
+      -w "%{http_code}" -o "./mods/${fname}" "$url" 2>/dev/null || echo "000")"
+
+    if [[ "$http_code" == "200" || -f "./mods/${fname}" && -s "./mods/${fname}" ]]; then
       ok=$((ok+1))
+    elif [[ "$http_code" == "403" ]]; then
+      # Mod author has disabled CDN distribution; skip silently (server will still work for most packs)
+      echo "[curseforge] manifest: (${i}/${total}) ${fname} -> SKIPPED (403 forbidden; mod blocks redistribution)"
+      rm -f "./mods/${fname}" 2>/dev/null || true
+      fail=$((fail+1))
     else
-      echo "[curseforge] manifest: (${i}/${total}) ${fname} -> FAILED download"
+      echo "[curseforge] manifest: (${i}/${total}) ${fname} -> FAILED (http ${http_code})"
       rm -f "./mods/${fname}" 2>/dev/null || true
       fail=$((fail+1))
     fi
@@ -322,6 +341,7 @@ download_mods_from_manifest_if_needed() {
   done < .bb_manifest_mods.txt
 
   echo "[curseforge] manifest: complete (ok=${ok} fail=${fail})"
+  # Don't exit nonzero just because some mods couldn't be downloaded (403/null url is common)
   rm -f .bb_manifest_mods.txt 2>/dev/null || true
 }
 
@@ -341,15 +361,18 @@ if ! have_runnable; then
     echo "[curseforge] Manifest: mc=${mc} loader=${loader} ver=${loader_ver}"
 
     case "$loader" in
-      forge|neoforge)
-        forge_install "$mc" "$loader_ver"
+      forge)
+        forge_install "$mc" "$loader_ver" || echo "[curseforge] WARN: forge_install failed; continuing anyway."
+        ;;
+      neoforge)
+        forge_install "$mc" "$loader_ver" || echo "[curseforge] WARN: neoforge_install failed; continuing anyway."
         ;;
       fabric)
-        fabric_install "$mc" "$loader_ver"
+        fabric_install "$mc" "$loader_ver" || echo "[curseforge] WARN: fabric_install failed; continuing anyway."
         ;;
       quilt)
         # Quilt uses the same installer interface as Fabric
-        fabric_install "$mc" "$loader_ver"
+        fabric_install "$mc" "$loader_ver" || echo "[curseforge] WARN: quilt/fabric_install failed; continuing anyway."
         ;;
       *)
         echo "[curseforge] WARN: Unsupported loader '${loader}' in manifest; skipping bootstrap."
