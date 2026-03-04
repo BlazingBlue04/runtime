@@ -154,8 +154,11 @@ find_java() {
 
 have_runnable() {
   [[ -f "./run.sh" || -f "./start.sh" || -f "./LaunchServer.sh" ]] && return 0
+  [[ -f "./ServerStart.sh" || -f "./StartServer.sh" || -f "./startserver.sh" ]] && return 0
   [[ -f "./server.jar" ]] && return 0
   [[ -d "./libraries" ]] && return 0
+  # Check for forge jars
+  compgen -G "./forge-*.jar" >/dev/null 2>&1 && return 0
   return 1
 }
 
@@ -194,7 +197,22 @@ PY
 forge_install() {
   local mc="$1" forge_ver="$2"
   local java
-  java="$(find_java)" || die "java not found in PATH/JAVA_HOME (required to install Forge)."
+
+  # Pick the right Java version for this MC version
+  local java_ver="21"
+  if [[ "$mc" =~ ^1\.([0-9]+) ]]; then
+    local minor="${BASH_REMATCH[1]}"
+    if (( minor <= 16 )); then java_ver="8"; fi
+    if (( minor >= 17 && minor <= 20 )); then java_ver="17"; fi
+  fi
+
+  # Try version-specific java first, then any java
+  if [[ -x "/opt/java/${java_ver}/bin/java" ]]; then
+    java="/opt/java/${java_ver}/bin/java"
+  else
+    java="$(find_java)" || die "java not found in PATH/JAVA_HOME (required to install Forge)."
+  fi
+
   export PATH="$(dirname "$java"):$PATH"
   export JAVA_HOME="$(dirname "$(dirname "$java")")"
 
@@ -288,7 +306,7 @@ download_mods_from_manifest_if_needed() {
     # Get download URL from CurseForge API
     local api="https://api.curseforge.com/v1/mods/${pid}/files/${fid}/download-url"
     local resp url
-    resp="$(curl -fsSL -H "x-api-key: ${CF_API_KEY}" -H "Accept: application/json" "$api" || true)"
+    resp="$(curl -sSL -H "x-api-key: ${CF_API_KEY}" -H "Accept: application/json" "$api" 2>/dev/null || true)"
 
     # Extract downloadUrl without jq/python
     # Response format: {"data":"https://..."} or {"data":null} for restricted mods
@@ -296,12 +314,16 @@ download_mods_from_manifest_if_needed() {
 
     if [[ -z "${url:-}" || "$url" == "null" ]]; then
       # Some mods block third-party distribution; try the CDN fallback pattern
-      local cdn_url="https://edge.forgecdn.net/files/${fid:0:4}/${fid:4}/$(
-        curl -fsSL -H "x-api-key: ${CF_API_KEY}" -H "Accept: application/json" \
-          "https://api.curseforge.com/v1/mods/${pid}/files/${fid}" 2>/dev/null \
-          | grep -oE '"fileName"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4
-      )"
-      if [[ "$cdn_url" =~ ^https:// ]]; then
+      local file_info=""
+      file_info="$(curl -sSL -H "x-api-key: ${CF_API_KEY}" -H "Accept: application/json" \
+          "https://api.curseforge.com/v1/mods/${pid}/files/${fid}" 2>/dev/null || true)"
+      local cdn_fname=""
+      cdn_fname="$(printf '%s' "$file_info" | grep -oE '"fileName"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4)"
+      local cdn_url=""
+      if [[ -n "$cdn_fname" ]]; then
+        cdn_url="https://edge.forgecdn.net/files/${fid:0:4}/${fid:4}/${cdn_fname}"
+      fi
+      if [[ -n "$cdn_url" && "$cdn_url" =~ ^https:// ]]; then
         url="$cdn_url"
       else
         echo "[curseforge] manifest: (${i}/${total}) pid=${pid} fid=${fid} -> SKIPPED (no download url; mod may block third-party distribution)"
@@ -320,10 +342,10 @@ download_mods_from_manifest_if_needed() {
     fi
 
     local http_code
-    http_code="$(curl -L --retry 3 --retry-delay 1 -A "Mozilla/5.0" \
+    http_code="$(curl -sL --retry 3 --retry-delay 1 -A "Mozilla/5.0" \
       -w "%{http_code}" -o "./mods/${fname}" "$url" 2>/dev/null)" || http_code="${http_code:-000}"
 
-    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ && -f "./mods/${fname}" && -s "./mods/${fname}" ]]; then
       ok=$((ok+1))
     elif [[ "$http_code" == "403" ]]; then
       # Mod author has disabled CDN distribution; note it and continue
@@ -401,6 +423,66 @@ if ! have_runnable; then
     echo "[curseforge] WARN: manifest.json not found or unparseable; cannot bootstrap loader."
   fi
 fi
+
+# Even if have_runnable returned true (e.g. ServerStart.sh exists), ensure the forge jar
+# referenced by start scripts actually exists. This handles packs like SkyFactory 4 that
+# ship a ServerStart.sh but no forge server jar.
+ensure_forge_jar_for_scripts() {
+  for sf in ./ServerStart.sh ./startserver.sh ./run.sh ./start.sh; do
+    [[ -f "$sf" ]] || continue
+
+    # Try to find what forge jar the script references
+    local jar_ref=""
+    # Literal reference
+    jar_ref="$(grep -Eo 'forge-[0-9][^"'"'"'[:space:]{}$]+\.jar' "$sf" 2>/dev/null | head -n1 || true)"
+    # Variable-based reference
+    if [[ -z "$jar_ref" ]] && grep -q 'forge-.*\.jar' "$sf" 2>/dev/null; then
+      local fv_val=""
+      fv_val="$(grep -oE '(FORGE_VERSION|FORGEVERSION|INSTALLER_VERSION)[[:space:]]*=[[:space:]]*"?[0-9][0-9a-zA-Z.\-]+"?' "$sf" \
+        | head -n1 | grep -oE '[0-9][0-9a-zA-Z.\-]+' | head -n1 || true)"
+      if [[ -n "$fv_val" ]]; then
+        jar_ref="forge-${fv_val}.jar"
+      fi
+    fi
+
+    [[ -n "$jar_ref" ]] || continue
+    [[ -f "$jar_ref" ]] && continue
+
+    echo "[curseforge] Start script $sf references $jar_ref which is missing; installing Forge..."
+
+    local fv="${jar_ref%.jar}"
+    fv="${fv#forge-}"  # e.g. 1.12.2-14.23.5.2860
+    local mc_part="${fv%%-*}"
+    local forge_ver="${fv#*-}"
+
+    if [[ -n "$mc_part" && -n "$forge_ver" && "$mc_part" != "$forge_ver" ]]; then
+      forge_install "$mc_part" "$forge_ver" 2>&1 || echo "[curseforge] WARN: Forge install for $fv failed."
+
+      # If forge_install produced universal jar, link it
+      local uni="forge-${fv}-universal.jar"
+      if [[ -f "$uni" && ! -f "$jar_ref" ]]; then
+        ln -sf "$uni" "$jar_ref" 2>/dev/null || cp -f "$uni" "$jar_ref" || true
+        echo "[curseforge] Linked $uni -> $jar_ref"
+      fi
+    else
+      # Try to get version info from manifest
+      if [[ -f manifest.json ]]; then
+        if mc_loader_pair="$(parse_manifest 2>/dev/null)"; then
+          local mc loader_id loader loader_ver
+          mc="$(echo "$mc_loader_pair" | cut -d' ' -f1)"
+          loader_id="$(echo "$mc_loader_pair" | cut -d' ' -f2)"
+          loader="$(echo "$loader_id" | cut -d'-' -f1)"
+          loader_ver="$(echo "$loader_id" | cut -d'-' -f2-)"
+          if [[ "$loader" == "forge" && -n "$loader_ver" ]]; then
+            forge_install "$mc" "$loader_ver" 2>&1 || echo "[curseforge] WARN: Forge install failed."
+          fi
+        fi
+      fi
+    fi
+    break  # Only process the first matching script
+  done
+}
+ensure_forge_jar_for_scripts
 
 # Always attempt to fetch missing mods from manifest
 download_mods_from_manifest_if_needed

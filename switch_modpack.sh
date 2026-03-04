@@ -368,6 +368,21 @@ detect_mc_version() {
     v="$(ls -1 ./forge-*.jar 2>/dev/null | head -n1 | sed -E 's#^(\./)?forge-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\2#')"
   fi
   v="$(strip_mc "$v")"
+
+  # Fallback: parse from manifest.json if present
+  if [[ -z "$v" && -f "./manifest.json" ]]; then
+    v="$(python3 -c 'import json; j=json.load(open("manifest.json")); print(j.get("minecraft",{}).get("version",""))' 2>/dev/null || true)"
+    if [[ -z "$v" ]]; then
+      v="$(jq -r '.minecraft.version // empty' manifest.json 2>/dev/null || true)"
+    fi
+  fi
+
+  # Fallback: detect from mod filenames (e.g. *-1.12.2-*.jar in mods/)
+  if [[ -z "$v" && -d "./mods" ]]; then
+    v="$(find ./mods -maxdepth 1 -type f -name '*.jar' 2>/dev/null \
+      | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | sort | uniq -c | sort -rn | head -n1 | awk '{print $2}' || true)"
+  fi
+
   echo "${v:-<unknown>}"
 }
 
@@ -375,6 +390,26 @@ detect_loader() {
   if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then echo "neoforge"; return; fi
   if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then echo "forge"; return; fi
   if has_glob "./libraries/net/fabricmc/fabric-loader/*/fabric-loader-*.jar"; then echo "fabric"; return; fi
+  # Detect from forge jar presence (older packs without libraries/)
+  if has_glob "./forge-*-universal.jar" || has_glob "./forge-*.jar"; then echo "forge"; return; fi
+  # Detect from manifest.json
+  if [[ -f "./manifest.json" ]]; then
+    local lid=""
+    lid="$(jq -r '(.minecraft.modLoaders[0].id // empty)' manifest.json 2>/dev/null || true)"
+    if [[ -z "$lid" ]]; then
+      lid="$(python3 -c 'import json; j=json.load(open("manifest.json")); ml=j.get("minecraft",{}).get("modLoaders",[]); print(ml[0]["id"] if ml else "")' 2>/dev/null || true)"
+    fi
+    case "$lid" in
+      forge-*) echo "forge"; return ;;
+      neoforge-*) echo "neoforge"; return ;;
+      fabric-*) echo "fabric"; return ;;
+      quilt-*) echo "quilt"; return ;;
+    esac
+  fi
+  # Detect from ServerStart.sh / start script content referencing forge
+  for sf in ./ServerStart.sh ./startserver.sh ./run.sh; do
+    if [[ -f "$sf" ]] && grep -qi 'forge' "$sf" 2>/dev/null; then echo "forge"; return; fi
+  done
   echo "<unknown>"
 }
 
@@ -521,7 +556,7 @@ disable_restart_loops_in_scripts() {
     #  - while true / while : / while [ 1 ] loops that re-exec the server
     #  - ATM/AllTheMods-style wrappers
     if grep -qiE \
-      'Restarting automatically|press Ctrl \+ C to cancel|Auto[- ]?restart|while true|while \(true\)|while :( |$)|START_ON_CRASH|auto_restart|RESTART_ON_CRASH' \
+      'Restarting automatically|press Ctrl \+ C to cancel|Auto[- ]?restart|while true|while \(true\)|while :( |;|$)|START_ON_CRASH|auto_restart|RESTART_ON_CRASH|until false' \
       "$f" 2>/dev/null; then
 
       # Normalize CRLF and ensure executable
@@ -538,12 +573,9 @@ disable_restart_loops_in_scripts() {
 ]*/true # read-timer removed (auto-restart disabled)/I' \
         "$f" 2>/dev/null || true
 
-      # 2) Convert  while true / while : / while (true)  loops that wrap the server launch.
-      #    Strategy: replace the while condition with `if false` so the block runs 0 times,
-      #    then the `do ... done` tail falls through naturally.
-      #    We only do this when the loop body contains a java / server invocation keyword.
-      if grep -qiE 'while[[:space:]]+(true|:|1|\(true\))[[:space:]]*(;|$)' "$f" 2>/dev/null; then
-        # Use python3 for reliable multi-line substitution (available in all Pterodactyl yolks)
+      # 2) Convert  while true / while : / while (true) / until false  loops that wrap the server launch.
+      #    Use python3 for reliable multi-line substitution (available in all Pterodactyl yolks)
+      if grep -qiE '(while[[:space:]]+(true|:|1|\(true\))|until[[:space:]]+false)[[:space:]]*(;|$)' "$f" 2>/dev/null; then
         python3 - "$f" <<'PY' 2>/dev/null && changed=1 || true
 import sys, re, os
 
@@ -551,36 +583,77 @@ path = sys.argv[1]
 with open(path, "r", errors="replace") as fh:
     src = fh.read()
 
-# Match: while true|:|1|(true) [; do] ... done blocks that contain server launch keywords.
-# Handles both:
-#   while true; do        (single-line header)
-#   while true\n  do      (do on next line)
-#   while true; do\n...done
-#   until false; do\n...done
+# Match while/until infinite loops.  Handles:
+#   while true; do        (do on same line)
+#   while true\ndo        (do on next line)
+#   while true ; do       (extra spaces)
+#   until false; do
+#   while :; do / while 1; do / while (true); do
 LOOP_RE = re.compile(
-    r'(^[ \t]*)((?:while[ \t]+(?:true|\(true\)|:|1)|until[ \t]+false)[ \t]*(?:;[ \t]*do|;[ \t]*)?[ \t]*\n(?:[ \t]*do[ \t]*\n)?)(.*?)(^[ \t]*done\b)',
-    re.MULTILINE | re.DOTALL
+    r'(^[ \t]*)'                                             # 1: indent
+    r'((?:while[ \t]+(?:true|\(true\)|:|1)|until[ \t]+false)'  # 2: header start
+    r'[ \t]*;?[ \t]*(?:do)?[ \t]*\n'                          #    optional ; do + newline
+    r'(?:[ \t]*do[ \t]*\n)?)',                                 #    optional do on next line
+    re.MULTILINE
 )
 
-SERVER_KEYWORDS = re.compile(r'\bjava\b|\bserver\.jar\b|forge-.*\.jar|fabric-server|run\.sh|StartServer|LaunchServer|nogui|@user_jvm_args', re.IGNORECASE)
+# Find matching "done" for a loop starting at a given position
+def find_done(src, start_pos):
+    depth = 1
+    # Search for do/done keywords line by line from start_pos
+    pos = start_pos
+    for line in src[start_pos:].split('\n'):
+        stripped = line.strip()
+        # Count nested loops
+        if re.match(r'(while|until|for)\b', stripped):
+            depth += 1
+        if re.match(r'done\b', stripped):
+            depth -= 1
+            if depth == 0:
+                return pos, pos + len(line)
+        pos += len(line) + 1  # +1 for the newline
+    return -1, -1
 
-def patch_loop(m):
-    indent, header, body, done = m.group(1), m.group(2), m.group(3), m.group(4)
+SERVER_KEYWORDS = re.compile(
+    r'\bjava\b|\bserver\.jar\b|forge-.*\.jar|fabric-server|run\.sh|'
+    r'StartServer|LaunchServer|startserver|nogui|@user_jvm_args|unix_args',
+    re.IGNORECASE
+)
+
+result = src
+offset = 0
+for m in list(LOOP_RE.finditer(src)):
+    indent = m.group(1)
+    header = m.group(2)
+    body_start = m.end()
+    
+    done_start, done_end = find_done(src, body_start)
+    if done_start < 0:
+        continue
+    
+    body = src[body_start:done_start]
     if not SERVER_KEYWORDS.search(body):
-        return m.group(0)  # not a server loop; leave alone
-    # Replace with a one-shot block (no loop)
-    return (
+        continue
+    
+    # Build replacement: comment out the loop, keep body as one-shot
+    replacement = (
         indent + "# [egg] auto-restart loop disabled\n" +
-        indent + "# " + header.rstrip("\n") + "  # was: restart loop\n" +
+        indent + "# " + header.strip() + "  # was: restart loop\n" +
         body +
         indent + "# done  # end of disabled restart loop\n"
     )
+    
+    # Apply replacement accounting for prior offset changes
+    orig_start = m.start() + offset
+    orig_end = done_end + offset
+    result = result[:orig_start] + replacement + result[orig_end:]
+    offset += len(replacement) - (done_end - m.start())
 
-patched, n = LOOP_RE.subn(patch_loop, src)
-if n > 0:
+if result != src:
     with open(path, "w") as fh:
-        fh.write(patched)
-    print(f"[switch] Patched {n} restart loop(s) in {path}")
+        fh.write(result)
+    count = src.count('while true') + src.count('while :') + src.count('until false')
+    print(f"[switch] Patched restart loop(s) in {path}")
 PY
       fi
 
@@ -610,7 +683,7 @@ fix_legacy_forge_jar_reference() {
   if [[ -z "${want:-}" ]]; then
     local fv_val
     # Use word-boundary to avoid matching NEOFORGE_VERSION when looking for FORGE_VERSION
-    fv_val="$(grep -oE "(^|[^A-Z_])(FORGE_VERSION|INSTALLER_VERSION|MC_JAR|JAR_VERSION)[[:space:]]*=[[:space:]]*\"?[0-9][0-9a-zA-Z.\-]+\"?" "$script" \
+    fv_val="$(grep -oE "(^|[^A-Z_])(FORGE_VERSION|INSTALLER_VERSION|MC_JAR|JAR_VERSION|FORGEVERSION)[[:space:]]*=[[:space:]]*\"?[0-9][0-9a-zA-Z.\-]+\"?" "$script" \
       | head -n 1 | grep -oE "[0-9][0-9a-zA-Z.\-]+" | head -n 1 || true)"
     if [[ -n "${fv_val:-}" ]]; then
       want="forge-${fv_val}.jar"
@@ -663,15 +736,32 @@ fix_legacy_forge_jar_reference() {
   local url="https://maven.minecraftforge.net/net/minecraftforge/forge/${fv}/${inst}"
 
   log "Legacy Forge jar missing ($want). Downloading installer for ${fv}..."
-  curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$inst" || { err "Failed to download Forge installer: $url"; return 0; }
-  "$JAVA" -Djava.awt.headless=true -jar "$inst" --installServer || { err "Forge --installServer failed."; return 0; }
+  if ! curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$inst" 2>/dev/null; then
+    err "Failed to download Forge installer: $url"
+    return 0
+  fi
+
+  log "Running Forge --installServer with $JAVA ..."
+  "$JAVA" -Djava.awt.headless=true -jar "$inst" --installServer 2>&1 || { err "Forge --installServer failed."; }
   rm -f "$inst" 2>/dev/null || true
 
-  # Search for the produced universal jar
+  # Search for the produced universal jar (may be in cwd or subdirs)
   local found_uni
-  found_uni="$(find . -maxdepth 3 -type f -name "${base}-universal.jar" -o -name "forge-${fv}-universal.jar" 2>/dev/null | head -n 1 || true)"
+  found_uni="$(find . -maxdepth 3 -type f \( -name "${base}-universal.jar" -o -name "forge-${fv}-universal.jar" \) 2>/dev/null | head -n 1 || true)"
   if [[ -n "${found_uni:-}" && -f "$found_uni" ]]; then
-    ln -sf "$(realpath "$found_uni" 2>/dev/null || echo "$found_uni")" "$uni" 2>/dev/null || cp -f "$found_uni" "$uni" || true
+    cp -f "$found_uni" "$uni" 2>/dev/null || true
+  fi
+
+  # For 1.12.2 Forge, --installServer may also produce the non-universal jar directly
+  # or produce a "forge-<ver>.jar" (without -universal) that is the actual server jar
+  if [[ ! -f "$uni" ]]; then
+    local found_any
+    found_any="$(find . -maxdepth 3 -type f -name 'forge-*.jar' ! -name '*-installer*' 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${found_any:-}" && -f "$found_any" ]]; then
+      cp -f "$found_any" "$want" 2>/dev/null || true
+      log "Forge installServer produced $found_any; copied as $want"
+      return 0
+    fi
   fi
 
   if [[ -f "$uni" ]]; then
@@ -679,6 +769,22 @@ fix_legacy_forge_jar_reference() {
     sed -i "s|${want}|${uni}|g" "$script" 2>/dev/null || true
     log "Forge installServer produced $uni; linked as $want"
     return 0
+  fi
+
+  # Last resort: check if --installServer produced a libraries/ dir with modern args
+  if [[ -d "./libraries" ]]; then
+    local args_file
+    args_file="$(find ./libraries -maxdepth 6 -name 'unix_args.txt' 2>/dev/null | head -n1 || true)"
+    if [[ -n "$args_file" ]]; then
+      log "Forge installServer produced modern layout ($args_file); creating run.sh"
+      cat > ./run.sh <<RUNSH
+#!/usr/bin/env bash
+exec java @user_jvm_args.txt @${args_file} nogui "\$@"
+RUNSH
+      chmod +x ./run.sh
+      [[ -f "user_jvm_args.txt" ]] || echo "" > user_jvm_args.txt
+      return 0
+    fi
   fi
 
   err "Forge install attempted but still cannot find ${want} (or ${uni})."
@@ -734,7 +840,7 @@ run_start_candidate() {
       local inst="${cand#FORGE_INSTALLER::}"
       log "Found Forge installer: $inst -> running --installServer"
       # java wrapper already in PATH, and MAX_RAM/MIN_RAM exported
-      "$JAVA" -jar "$inst" --installServer
+      "$JAVA" -jar "$inst" --installServer || true
       rm -f "$inst" 2>/dev/null || true
 
       # After install, re-discover start candidate
@@ -971,36 +1077,55 @@ start_server() {
       # and strips auto-restart loops before we exec the script.
       preflight_start_script "$s"
 
-      # Post-preflight safety check: if the script references a forge jar that still
-      # doesn't exist (download/install failed), try one more bootstrap attempt.
-      local missing_jar=""
-      missing_jar="$(grep -Eo 'forge-[0-9][^"'"'"'[:space:]{}$]+\.jar' "$s" 2>/dev/null | head -n1 || true)"
-      if [[ -n "${missing_jar:-}" && ! -f "$missing_jar" ]]; then
-        warn "Start script references $missing_jar which does not exist; attempting forge bootstrap..."
-        # Try to find or create the jar
-        local fv="${missing_jar%.jar}"
+      # Post-preflight safety check: resolve what forge jar the script will actually try
+      # to launch (including variable-based references like forge-${FORGE_VERSION}.jar)
+      # and ensure it exists.
+      local resolved_jar=""
+      # Check literal reference first
+      resolved_jar="$(grep -Eo 'forge-[0-9][^"'"'"'[:space:]{}$]+\.jar' "$s" 2>/dev/null | head -n1 || true)"
+      # If no literal, try to resolve variable-based reference
+      if [[ -z "$resolved_jar" ]] && grep -q 'forge-.*\.jar' "$s" 2>/dev/null; then
+        local fv_val=""
+        fv_val="$(grep -oE '(FORGE_VERSION|FORGEVERSION|INSTALLER_VERSION)[[:space:]]*=[[:space:]]*"?[0-9][0-9a-zA-Z.\-]+"?' "$s" \
+          | head -n1 | grep -oE '[0-9][0-9a-zA-Z.\-]+' | head -n1 || true)"
+        if [[ -n "$fv_val" ]]; then
+          resolved_jar="forge-${fv_val}.jar"
+        fi
+      fi
+
+      if [[ -n "${resolved_jar:-}" && ! -f "$resolved_jar" ]]; then
+        warn "Start script references $resolved_jar which does not exist; attempting forge install..."
+        local fv="${resolved_jar%.jar}"
         fv="${fv#forge-}"  # e.g. 1.12.2-14.23.5.2860
-        local mc_part="${fv%%-*}"  # e.g. 1.12.2
-        local forge_part="${fv#*-}"  # e.g. 14.23.5.2860
-        if [[ -n "$mc_part" && -n "$forge_part" ]]; then
-          local inst_jar="forge-${fv}-installer.jar"
-          local inst_url="https://maven.minecraftforge.net/net/minecraftforge/forge/${fv}/${inst_jar}"
-          log "Downloading Forge installer: $inst_url"
-          if curl -fsSL --retry 3 --retry-delay 2 -o "$inst_jar" "$inst_url" 2>/dev/null; then
-            log "Running Forge --installServer..."
-            "$JAVA" -Djava.awt.headless=true -jar "$inst_jar" --installServer 2>&1 || true
-            rm -f "$inst_jar" 2>/dev/null || true
-            # Link universal jar if the exact name is still missing
-            if [[ ! -f "$missing_jar" ]]; then
-              local uni_jar="forge-${fv}-universal.jar"
-              if [[ -f "$uni_jar" ]]; then
-                ln -sf "$uni_jar" "$missing_jar" 2>/dev/null || cp -f "$uni_jar" "$missing_jar" || true
-                log "Linked $uni_jar -> $missing_jar"
+        local inst_jar="forge-${fv}-installer.jar"
+        local inst_url="https://maven.minecraftforge.net/net/minecraftforge/forge/${fv}/${inst_jar}"
+        log "Downloading Forge installer: $inst_url"
+        if curl -fsSL --retry 3 --retry-delay 2 -o "$inst_jar" "$inst_url" 2>/dev/null; then
+          log "Running Forge --installServer..."
+          "$JAVA" -Djava.awt.headless=true -jar "$inst_jar" --installServer 2>&1 || true
+          rm -f "$inst_jar" 2>/dev/null || true
+          # Link universal jar if the exact name is still missing
+          if [[ ! -f "$resolved_jar" ]]; then
+            local uni_jar="forge-${fv}-universal.jar"
+            if [[ -f "$uni_jar" ]]; then
+              ln -sf "$uni_jar" "$resolved_jar" 2>/dev/null || cp -f "$uni_jar" "$resolved_jar" || true
+              log "Linked $uni_jar -> $resolved_jar"
+            else
+              # Search more broadly
+              local any_forge
+              any_forge="$(find . -maxdepth 2 -name 'forge-*.jar' ! -name '*installer*' 2>/dev/null | head -n1 || true)"
+              if [[ -n "$any_forge" ]]; then
+                cp -f "$any_forge" "$resolved_jar" 2>/dev/null || true
+                log "Copied $any_forge -> $resolved_jar"
               fi
             fi
-          else
-            warn "Failed to download Forge installer from $inst_url"
           fi
+          # Also update the script to use the universal jar name directly
+          if [[ -f "forge-${fv}-universal.jar" && ! -f "$resolved_jar" ]]; then
+            sed -i "s|${resolved_jar}|forge-${fv}-universal.jar|g" "$s" 2>/dev/null || true
+          fi
+        else
+          warn "Failed to download Forge installer from $inst_url"
         fi
       fi
 
@@ -1074,12 +1199,10 @@ start_server() {
       fi
       exec "$JAVA" -jar "$j" nogui
     else
-      # Old Forge jars (1.12.2 and earlier) may use a non-standard manifest but
-      # are still launchable with -jar on the correct Java version (Java 8).
-      # Only warn and skip if we're NOT on Java 8.
-      local java_major_ver=""
-      java_major_ver="$("$JAVA" -version 2>&1 | head -n1 | grep -oE '(1\.8\.|"1\.8)' || true)"
-      if [[ -n "$java_major_ver" ]]; then
+      # Old Forge jars (1.12.2 and earlier) may still be launchable with -jar on Java 8.
+      local java_ver_str=""
+      java_ver_str="$("$JAVA" -version 2>&1 | head -n1 || true)"
+      if [[ "$java_ver_str" =~ (1\.8\.|\"1\.8) ]]; then
         log "Starting via legacy Forge jar (Java 8): $j"
         exec "$JAVA" -jar "$j" nogui
       else
