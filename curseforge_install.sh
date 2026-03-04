@@ -310,7 +310,7 @@ download_mods_from_manifest_if_needed() {
 
     # Extract downloadUrl without jq/python
     # Response format: {"data":"https://..."} or {"data":null} for restricted mods
-    url="$(printf '%s' "$resp" | grep -oE '"data"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4)"
+    url="$(printf '%s' "$resp" | grep -oE '"data"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
 
     if [[ -z "${url:-}" || "$url" == "null" ]]; then
       # Some mods block third-party distribution; try the CDN fallback pattern
@@ -318,7 +318,7 @@ download_mods_from_manifest_if_needed() {
       file_info="$(curl -sSL -H "x-api-key: ${CF_API_KEY}" -H "Accept: application/json" \
           "https://api.curseforge.com/v1/mods/${pid}/files/${fid}" 2>/dev/null || true)"
       local cdn_fname=""
-      cdn_fname="$(printf '%s' "$file_info" | grep -oE '"fileName"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4)"
+      cdn_fname="$(printf '%s' "$file_info" | grep -oE '"fileName"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
       local cdn_url=""
       if [[ -n "$cdn_fname" ]]; then
         cdn_url="https://edge.forgecdn.net/files/${fid:0:4}/${fid:4}/${cdn_fname}"
@@ -428,17 +428,24 @@ fi
 # referenced by start scripts actually exists. This handles packs like SkyFactory 4 that
 # ship a ServerStart.sh but no forge server jar.
 ensure_forge_jar_for_scripts() {
-  for sf in ./ServerStart.sh ./startserver.sh ./run.sh ./start.sh; do
+  for sf in ./ServerStart.sh ./startserver.sh ./run.sh ./start.sh ./LaunchServer.sh ./StartServer.sh; do
     [[ -f "$sf" ]] || continue
 
     # Try to find what forge jar the script references
     local jar_ref=""
-    # Literal reference
+    # Literal reference: forge-1.12.2-14.23.5.2860.jar
     jar_ref="$(grep -Eo 'forge-[0-9][^"'"'"'[:space:]{}$]+\.jar' "$sf" 2>/dev/null | head -n1 || true)"
-    # Variable-based reference
+
+    # Variable assignment containing a forge jar name: FORGE_JAR="forge-1.12.2-14.23.5.2860.jar"
+    if [[ -z "$jar_ref" ]]; then
+      jar_ref="$(grep -oE '[A-Z_]+=[[:space:]]*"?forge-[0-9][0-9a-zA-Z.\-]+\.jar"?' "$sf" 2>/dev/null \
+        | grep -oE 'forge-[0-9][0-9a-zA-Z.\-]+\.jar' | head -n1 || true)"
+    fi
+
+    # Variable-based reference: forge-${FORGE_VERSION}.jar where FORGE_VERSION=1.12.2-14.23.5.2860
     if [[ -z "$jar_ref" ]] && grep -q 'forge-.*\.jar' "$sf" 2>/dev/null; then
       local fv_val=""
-      fv_val="$(grep -oE '(FORGE_VERSION|FORGEVERSION|INSTALLER_VERSION)[[:space:]]*=[[:space:]]*"?[0-9][0-9a-zA-Z.\-]+"?' "$sf" \
+      fv_val="$(grep -oE '(FORGE_VERSION|FORGEVERSION|INSTALLER_VERSION|FORGE_JAR_VERSION)[[:space:]]*=[[:space:]]*"?[0-9][0-9a-zA-Z.\-]+"?' "$sf" \
         | head -n1 | grep -oE '[0-9][0-9a-zA-Z.\-]+' | head -n1 || true)"
       if [[ -n "$fv_val" ]]; then
         jar_ref="forge-${fv_val}.jar"
@@ -463,6 +470,15 @@ ensure_forge_jar_for_scripts() {
       if [[ -f "$uni" && ! -f "$jar_ref" ]]; then
         ln -sf "$uni" "$jar_ref" 2>/dev/null || cp -f "$uni" "$jar_ref" || true
         echo "[curseforge] Linked $uni -> $jar_ref"
+      fi
+      # Also check if --installServer produced it directly in root
+      if [[ ! -f "$jar_ref" ]]; then
+        local found_forge
+        found_forge="$(find . -maxdepth 2 -name 'forge-*.jar' ! -name '*installer*' 2>/dev/null | head -n1 || true)"
+        if [[ -n "$found_forge" ]]; then
+          cp -f "$found_forge" "$jar_ref" 2>/dev/null || true
+          echo "[curseforge] Copied $found_forge -> $jar_ref"
+        fi
       fi
     else
       # Try to get version info from manifest
