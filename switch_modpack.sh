@@ -592,28 +592,43 @@ fix_legacy_forge_jar_reference() {
   local script="$1"
   [[ -f "$script" ]] || return 0
 
-  # Find a forge jar reference like: forge-1.12.2-14.23.5.2860.jar
-local want
-want="$(grep -Eo 'forge-[^"\x27[:space:]]+\.jar' "$script" | head -n 1 || true)"
+  # Find the forge jar name the script intends to launch.
+  # Handles: literal paths, ${VAR}-based references, and disk-scan fallback.
+  local want=""
 
-# Some packs (SkyFactory 4) build the jar name via variables; if we didn't match a literal,
-# fall back to any forge-*-universal.jar we can find and create the expected non-universal alias.
-if [[ -z "${want:-}" ]]; then
-  local uni_any bn
-  uni_any="$(find . -maxdepth 3 -type f -name 'forge-*-universal.jar' 2>/dev/null | head -n 1 || true)"
-  if [[ -n "${uni_any:-}" ]]; then
-    bn="${uni_any##*/}"
-    want="${bn/-universal.jar/.jar}"
-    # Ensure the universal jar is accessible from cwd under its basename
-    if [[ "$uni_any" != "./$bn" && ! -f "./$bn" ]]; then
-      ln -sf "$(realpath "$uni_any" 2>/dev/null || echo "$uni_any")" "./$bn" 2>/dev/null || cp -f "$uni_any" "./$bn" || true
-    fi
-    # Also rewrite the script so it references the universal jar directly
-    sed -i "s|${want}|${bn}|g" "$script" 2>/dev/null || true
+  # 1) Literal jar name with no shell variable syntax
+  local literal
+  literal="$(grep -Eo 'forge-[0-9][^"'"'"'[:space:]{}$]+\.jar' "$script" | grep -v "\$" | head -n 1 || true)"
+  if [[ -n "${literal:-}" ]]; then
+    want="$literal"
   fi
-fi
 
-[[ -n "${want:-}" ]] || return 0
+  # 2) Script sets FORGE_VERSION="1.12.2-14.23.5.2860" then calls forge-${FORGE_VERSION}.jar
+  if [[ -z "${want:-}" ]]; then
+    local fv_val
+    fv_val="$(grep -oE "(FORGE_VERSION|INSTALLER_VERSION|MC_JAR|JAR_VERSION)[[:space:]]*=[[:space:]]*\"?[0-9][0-9a-zA-Z.\-]+\"?" "$script" \
+      | head -n 1 | grep -oE "[0-9][0-9a-zA-Z.\-]+" | head -n 1 || true)"
+    if [[ -n "${fv_val:-}" ]]; then
+      want="forge-${fv_val}.jar"
+      log "Resolved variable-based jar name: $want"
+    fi
+  fi
+
+  # 3) Universal jar already on disk -> derive non-universal name
+  if [[ -z "${want:-}" ]]; then
+    local uni_any bn
+    uni_any="$(find . -maxdepth 3 -type f -name "forge-*-universal.jar" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${uni_any:-}" ]]; then
+      bn="${uni_any##*/}"
+      want="${bn/-universal.jar/.jar}"
+      if [[ "$uni_any" != "./$bn" && ! -f "./$bn" ]]; then
+        ln -sf "$(realpath "$uni_any" 2>/dev/null || echo "$uni_any")" "./$bn" 2>/dev/null || cp -f "$uni_any" "./$bn" || true
+      fi
+      sed -i "s|${want}|${bn}|g" "$script" 2>/dev/null || true
+    fi
+  fi
+
+  [[ -n "${want:-}" ]] || return 0
 
   if [[ -f "$want" ]]; then
     return 0
@@ -624,64 +639,48 @@ fi
   local srv="${base}-server.jar"
 
   if [[ -f "$uni" ]]; then
-    # Try symlink first; if the symlink target isn't accessible (e.g. relative path issue), hard-copy
     ln -sf "$(realpath "$uni" 2>/dev/null || echo "$uni")" "$want" 2>/dev/null || cp -f "$uni" "$want"
-    # Verify the result is actually accessible; fall back to hard copy if not
-    if [[ ! -f "$want" ]]; then
-      cp -f "$uni" "$want" || true
-    fi
+    if [[ ! -f "$want" ]]; then cp -f "$uni" "$want" || true; fi
     log "Fixed legacy Forge jar name: $want -> $uni"
-    # Also rewrite the reference inside the script itself so the sanitized copy picks it up
     sed -i "s|${want}|${uni}|g" "$script" 2>/dev/null || true
     return 0
   fi
   if [[ -f "$srv" ]]; then
     ln -sf "$(realpath "$srv" 2>/dev/null || echo "$srv")" "$want" 2>/dev/null || cp -f "$srv" "$want"
-    if [[ ! -f "$want" ]]; then
-      cp -f "$srv" "$want" || true
-    fi
+    if [[ ! -f "$want" ]]; then cp -f "$srv" "$want" || true; fi
     log "Fixed legacy Forge jar name: $want -> $srv"
     sed -i "s|${want}|${srv}|g" "$script" 2>/dev/null || true
     return 0
   fi
 
-  # If no jar exists, try installing Forge server using the installer from Forge Maven
-  local fv="${base#forge-}"  # 1.12.2-14.23.5.2860
+  # Neither jar exists - download the Forge installer and run --installServer
+  local fv="${base#forge-}"  # e.g. 1.12.2-14.23.5.2860
   local inst="forge-${fv}-installer.jar"
   local url="https://maven.minecraftforge.net/net/minecraftforge/forge/${fv}/${inst}"
 
-  log "Legacy Forge jar missing ($want). Attempting Forge installServer for ${fv}..."
-  curl -fL --retry 3 --retry-delay 1 "$url" -o "$inst"
-  "$JAVA" -jar "$inst" --installServer
-  # Some packs/placeholders drop output in subdirs; search a bit.
-  if [[ ! -f "$uni" ]]; then
-    local found_any
-    found_any="$(find . -maxdepth 3 -type f -name "${base}-universal.jar" -o -name "forge-${fv}-universal.jar" 2>/dev/null | head -n 1 || true)"
-    if [[ -n "${found_any:-}" && -f "$found_any" ]]; then
-      # Link into cwd where ServerStart.sh expects it
-      ln -sf "$found_any" "$uni" 2>/dev/null || cp -f "$found_any" "$uni" || true
-    fi
+  log "Legacy Forge jar missing ($want). Downloading installer for ${fv}..."
+  curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$inst" || { err "Failed to download Forge installer: $url"; return 0; }
+  "$JAVA" -Djava.awt.headless=true -jar "$inst" --installServer || { err "Forge --installServer failed."; return 0; }
+  rm -f "$inst" 2>/dev/null || true
+
+  # Search for the produced universal jar
+  local found_uni
+  found_uni="$(find . -maxdepth 3 -type f -name "${base}-universal.jar" -o -name "forge-${fv}-universal.jar" 2>/dev/null | head -n 1 || true)"
+  if [[ -n "${found_uni:-}" && -f "$found_uni" ]]; then
+    ln -sf "$(realpath "$found_uni" 2>/dev/null || echo "$found_uni")" "$uni" 2>/dev/null || cp -f "$found_uni" "$uni" || true
   fi
 
-  # After install, universal jar usually exists
   if [[ -f "$uni" ]]; then
     ln -sf "$uni" "$want" 2>/dev/null || cp -f "$uni" "$want"
-    log "Forge installServer produced $uni; linked to $want"
-    return 0
-  fi
-
-  # Try to find any forge universal jar that matches the version
-  local found
-  found="$(ls -1 forge-${fv}-universal.jar 2>/dev/null | head -n 1 || true)"
-  if [[ -n "${found:-}" && -f "$found" ]]; then
-    ln -sf "$found" "$want" 2>/dev/null || cp -f "$found" "$want"
-    log "Linked $want -> $found"
+    sed -i "s|${want}|${uni}|g" "$script" 2>/dev/null || true
+    log "Forge installServer produced $uni; linked as $want"
     return 0
   fi
 
   err "Forge install attempted but still cannot find ${want} (or ${uni})."
   return 0
 }
+
 
 preflight_start_script() {
   local script="$1"
@@ -975,54 +974,36 @@ start_server() {
     exec "$JAVA" -jar ./server.jar nogui
   fi
 
-  # Prefer a top-level forge-*.jar if it has a Main-Class; otherwise skip.
+  # Prefer a top-level forge-*.jar.
+  # ALWAYS prefer -universal.jar over the thin launcher jar; the thin jar uses LaunchWrapper
+  # which crashes with Java 9+ (ClassCastException: AppClassLoader cannot be cast to URLClassLoader).
   if has_glob "./forge-*.jar"; then
-    local j
-    j="$(ls -1 ./forge-*.jar 2>/dev/null | head -n1)"
-    if unzip -p "$j" META-INF/MANIFEST.MF 2>/dev/null | grep -qi '^Main-Class:'; then
+    # Pick universal jar first, then any non-installer jar
+    local j=""
+    local uni_j
+    uni_j="$(ls -1 ./forge-*-universal.jar 2>/dev/null | head -n1 || true)"
+    if [[ -n "${uni_j:-}" ]]; then
+      j="$uni_j"
+    else
+      j="$(ls -1 ./forge-*.jar 2>/dev/null | grep -vi installer | head -n1 || true)"
+    fi
+    [[ -n "${j:-}" ]] || j="$(ls -1 ./forge-*.jar 2>/dev/null | head -n1 || true)"
+
+    if [[ -n "${j:-}" ]] && unzip -p "$j" META-INF/MANIFEST.MF 2>/dev/null | grep -qi '^Main-Class:'; then
       log "Starting via jar: $j"
-      # If this is a Forge installer jar, run it headless in installServer mode, then start the generated server.
+      # If this is a Forge installer jar, run --installServer first, then re-discover start method
       if [[ "$j" == *"-installer.jar" ]]; then
         log "Forge installer detected; running --installServer (headless): $j"
-        java -Djava.awt.headless=true -jar "$j" --installServer || true
+        "$JAVA" -Djava.awt.headless=true -jar "$j" --installServer || true
+        rm -f "$j" 2>/dev/null || true
 
-        # After installation, look for the real start method
-        local cand=""
-        local uni=""
-        uni="$(find . -maxdepth 3 -type f -name 'forge-*-universal*.jar' 2>/dev/null | head -n 1 || true)"
-        if [[ -n "$uni" ]]; then
-          log "Starting via Forge universal jar: $uni"
-          exec "$JAVA" -jar "$uni" nogui
-        fi
-
-        local fsj=""
-        fsj="$(find . -maxdepth 2 -type f -name 'forge-*.jar' 2>/dev/null | grep -vi 'installer' | head -n 1 || true)"
-        if [[ -n "$fsj" ]]; then
-          log "Starting via Forge server jar: $fsj"
-          exec "$JAVA" -jar "$fsj" nogui
-        fi
-
-        local fsj
-        fsj="$(find . -maxdepth 2 -type f -name 'forge-*.jar' 2>/dev/null | grep -vi 'installer' | head -n 1 || true)"
-        if [[ -n "$fsj" ]]; then
-          log "Starting via Forge server jar: $fsj"
-          exec "$JAVA" -jar "$fsj" nogui
-        fi
-
+        # Re-discover after install (prefer run.sh > universal jar > any forge jar)
+        local cand
         cand="$(find_start_candidate || true)"
         if [[ -n "$cand" ]]; then
           log "Post-install start candidate: $cand"
           run_start_candidate "$cand"
         fi
-
-        # Common Forge output for 1.12.2 is a 'forge-*-universal.jar' in root
-        local uni=""
-        uni="$(find . -maxdepth 2 -type f -name 'forge-*-universal*.jar' 2>/dev/null | head -n 1 || true)"
-        if [[ -n "$uni" ]]; then
-          log "Starting via Forge universal jar: $uni"
-          exec "$JAVA" -jar "$uni" nogui
-        fi
-
         err "Forge installer finished but no runnable start method was produced."
         exit 1
       fi

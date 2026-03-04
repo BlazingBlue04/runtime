@@ -280,6 +280,7 @@ download_mods_from_manifest_if_needed() {
   echo "[curseforge] manifest: ${total} required mods to fetch."
 
   local i=0
+  local skipped_mods=()
   while read -r pid fid; do
     [[ -n "${pid:-}" && -n "${fid:-}" ]] || continue
     i=$((i+1))
@@ -304,6 +305,7 @@ download_mods_from_manifest_if_needed() {
         url="$cdn_url"
       else
         echo "[curseforge] manifest: (${i}/${total}) pid=${pid} fid=${fid} -> SKIPPED (no download url; mod may block third-party distribution)"
+        skipped_mods+=("pid=${pid} fid=${fid}  ->  https://www.curseforge.com/minecraft/mc-mods/${pid}/files/${fid}")
         fail=$((fail+1))
         continue
       fi
@@ -324,8 +326,9 @@ download_mods_from_manifest_if_needed() {
     if [[ "$http_code" == "200" || -f "./mods/${fname}" && -s "./mods/${fname}" ]]; then
       ok=$((ok+1))
     elif [[ "$http_code" == "403" ]]; then
-      # Mod author has disabled CDN distribution; skip silently (server will still work for most packs)
+      # Mod author has disabled CDN distribution; note it and continue
       echo "[curseforge] manifest: (${i}/${total}) ${fname} -> SKIPPED (403 forbidden; mod blocks redistribution)"
+      skipped_mods+=("${fname}  ->  https://www.curseforge.com/minecraft/mc-mods/${pid}/files/${fid}")
       rm -f "./mods/${fname}" 2>/dev/null || true
       fail=$((fail+1))
     else
@@ -341,6 +344,22 @@ download_mods_from_manifest_if_needed() {
   done < .bb_manifest_mods.txt
 
   echo "[curseforge] manifest: complete (ok=${ok} fail=${fail})"
+
+  # Print a clear summary of skipped mods so server admins can add them manually
+  if [[ ${#skipped_mods[@]} -gt 0 ]]; then
+    echo ""
+    echo "[curseforge] ============================================================"
+    echo "[curseforge] MANUAL ACTION REQUIRED: ${#skipped_mods[@]} mod(s) could not"
+    echo "[curseforge] be downloaded automatically (blocked redistribution / 403)."
+    echo "[curseforge] Add these mods manually to the /mods folder:"
+    echo "[curseforge] ------------------------------------------------------------"
+    for entry in "${skipped_mods[@]}"; do
+      echo "[curseforge]   $entry"
+    done
+    echo "[curseforge] ============================================================"
+    echo ""
+  fi
+
   # Don't exit nonzero just because some mods couldn't be downloaded (403/null url is common)
   rm -f .bb_manifest_mods.txt 2>/dev/null || true
 }
