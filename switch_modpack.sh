@@ -606,7 +606,8 @@ fix_legacy_forge_jar_reference() {
   # 2) Script sets FORGE_VERSION="1.12.2-14.23.5.2860" then calls forge-${FORGE_VERSION}.jar
   if [[ -z "${want:-}" ]]; then
     local fv_val
-    fv_val="$(grep -oE "(FORGE_VERSION|INSTALLER_VERSION|MC_JAR|JAR_VERSION)[[:space:]]*=[[:space:]]*\"?[0-9][0-9a-zA-Z.\-]+\"?" "$script" \
+    # Use word-boundary to avoid matching NEOFORGE_VERSION when looking for FORGE_VERSION
+    fv_val="$(grep -oE "(^|[^A-Z_])(FORGE_VERSION|INSTALLER_VERSION|MC_JAR|JAR_VERSION)[[:space:]]*=[[:space:]]*\"?[0-9][0-9a-zA-Z.\-]+\"?" "$script" \
       | head -n 1 | grep -oE "[0-9][0-9a-zA-Z.\-]+" | head -n 1 || true)"
     if [[ -n "${fv_val:-}" ]]; then
       want="forge-${fv_val}.jar"
@@ -688,11 +689,34 @@ preflight_start_script() {
   sed -i 's/\r$//' "$script" 2>/dev/null || true
   chmod +x "$script" 2>/dev/null || true
 
-  # Apply global wrapper patches first
+  # Strip auto-restart loops (ATM, RLCraft wrappers, etc.)
   disable_restart_loops_in_scripts
 
-  # Specific legacy Forge fix (SkyFactory 4 and similar 1.12 packs)
-  fix_legacy_forge_jar_reference "$script"
+  # Legacy Forge jar fix (SkyFactory 4 / RLCraft / 1.12.2 packs).
+  # Skip for NeoForge and modern Forge packs - they handle their own install via startserver.sh
+  # and fix_legacy's variable-name heuristics produce wrong results on those scripts.
+  local is_neoforge=0
+  if grep -qiE 'neoforge|neo_forge|NEOFORGE' "$script" 2>/dev/null; then
+    is_neoforge=1
+  fi
+  if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then
+    is_neoforge=1
+  fi
+
+  if [[ "$is_neoforge" -eq 0 ]]; then
+    fix_legacy_forge_jar_reference "$script"
+  else
+    log "Skipping legacy Forge jar fix for NeoForge script: $script"
+    # For NeoForge, if the installer jar is present but --installServer hasn't run yet,
+    # detect and run it now so the script's install check passes.
+    local neo_inst
+    neo_inst="$(find . -maxdepth 2 -type f -name 'neoforge-*-installer.jar' 2>/dev/null | head -n1 || true)"
+    if [[ -n "${neo_inst:-}" ]]; then
+      log "Running NeoForge installer: $neo_inst"
+      "$JAVA" -Djava.awt.headless=true -jar "$neo_inst" --installServer 2>&1 | grep -v "^$" || true
+      rm -f "$neo_inst" 2>/dev/null || true
+    fi
+  fi
 }
 
 run_start_candidate() {
@@ -821,14 +845,16 @@ PY
 
 download_forge_installer() {
   local mc="$1" forge_ver="$2"
-  # Forge installer URL pattern:
-  # https://maven.minecraftforge.net/net/minecraftforge/forge/<mc>-<forge_ver>/forge-<mc>-<forge_ver>-installer.jar
   local base="https://maven.minecraftforge.net/net/minecraftforge/forge"
   local fn="forge-${mc}-${forge_ver}-installer.jar"
   local url="${base}/${mc}-${forge_ver}/${fn}"
-  log "[switch] Downloading Forge installer: $url"
-  curl -L --fail -o "$fn" "$url"
-  echo "$fn"
+  # IMPORTANT: log() must go to stderr here; this function's stdout is captured by callers.
+  log "[switch] Downloading Forge installer: $url" >&2
+  if ! curl -fsSL --retry 3 --retry-delay 2 -o "$fn" "$url"; then
+    echo "[switch] ERROR: Failed to download Forge installer: $url" >&2
+    return 1
+  fi
+  echo "$fn"   # only the filename reaches the caller via $()
 }
 
 bootstrap_forge_from_manifest() {
