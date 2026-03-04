@@ -320,10 +320,10 @@ download_mods_from_manifest_if_needed() {
     fi
 
     local http_code
-    http_code="$(curl -fL --retry 3 --retry-delay 1 -A "Mozilla/5.0" \
-      -w "%{http_code}" -o "./mods/${fname}" "$url" 2>/dev/null || echo "000")"
+    http_code="$(curl -L --retry 3 --retry-delay 1 -A "Mozilla/5.0" \
+      -w "%{http_code}" -o "./mods/${fname}" "$url" 2>/dev/null)" || http_code="${http_code:-000}"
 
-    if [[ "$http_code" == "200" || -f "./mods/${fname}" && -s "./mods/${fname}" ]]; then
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
       ok=$((ok+1))
     elif [[ "$http_code" == "403" ]]; then
       # Mod author has disabled CDN distribution; note it and continue

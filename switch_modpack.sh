@@ -361,11 +361,11 @@ detect_mc_version() {
   fi
   # sometimes a server jar is named minecraft_server.1.16.5.jar
   if [[ -z "$v" ]] && has_glob "./minecraft_server.*.jar"; then
-    v="$(ls -1 ./minecraft_server.*.jar 2>/dev/null | head -n1 | sed -E 's/^minecraft_server\.([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/')"
+    v="$(ls -1 ./minecraft_server.*.jar 2>/dev/null | head -n1 | sed -E 's#^(\./)?minecraft_server\.([0-9]+\.[0-9]+(\.[0-9]+)?).*#\2#')"
   fi
   # parse from forge jar name
   if [[ -z "$v" ]] && has_glob "./forge-*.jar"; then
-    v="$(ls -1 ./forge-*.jar 2>/dev/null | head -n1 | sed -E 's#./forge-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\1#')"
+    v="$(ls -1 ./forge-*.jar 2>/dev/null | head -n1 | sed -E 's#^(\./)?forge-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\2#')"
   fi
   v="$(strip_mc "$v")"
   echo "${v:-<unknown>}"
@@ -542,7 +542,7 @@ disable_restart_loops_in_scripts() {
       #    Strategy: replace the while condition with `if false` so the block runs 0 times,
       #    then the `do ... done` tail falls through naturally.
       #    We only do this when the loop body contains a java / server invocation keyword.
-      if grep -qiE 'while[[:space:]]+(true|:|1|\(true\))' "$f" 2>/dev/null; then
+      if grep -qiE 'while[[:space:]]+(true|:|1|\(true\))[[:space:]]*(;|$)' "$f" 2>/dev/null; then
         # Use python3 for reliable multi-line substitution (available in all Pterodactyl yolks)
         python3 - "$f" <<'PY' 2>/dev/null && changed=1 || true
 import sys, re, os
@@ -551,15 +551,18 @@ path = sys.argv[1]
 with open(path, "r", errors="replace") as fh:
     src = fh.read()
 
-# Match: while true|:|1|(true) ... done blocks that contain server launch keywords
-# We replace the `while` header with a comment + single-run `if true` guard removed,
-# effectively making the block execute once and then fall through (no restart).
+# Match: while true|:|1|(true) [; do] ... done blocks that contain server launch keywords.
+# Handles both:
+#   while true; do        (single-line header)
+#   while true\n  do      (do on next line)
+#   while true; do\n...done
+#   until false; do\n...done
 LOOP_RE = re.compile(
-    r'(^[ \t]*)(while[ \t]+(?:true|\(true\)|:|1)[ \t]*(?:;[ \t*]*)?\n)(.*?)(^[ \t]*done\b)',
+    r'(^[ \t]*)((?:while[ \t]+(?:true|\(true\)|:|1)|until[ \t]+false)[ \t]*(?:;[ \t]*do|;[ \t]*)?[ \t]*\n(?:[ \t]*do[ \t]*\n)?)(.*?)(^[ \t]*done\b)',
     re.MULTILINE | re.DOTALL
 )
 
-SERVER_KEYWORDS = re.compile(r'\bjava\b|\bserver\.jar\b|forge-.*\.jar|fabric-server|run\.sh|StartServer|LaunchServer|nogui', re.IGNORECASE)
+SERVER_KEYWORDS = re.compile(r'\bjava\b|\bserver\.jar\b|forge-.*\.jar|fabric-server|run\.sh|StartServer|LaunchServer|nogui|@user_jvm_args', re.IGNORECASE)
 
 def patch_loop(m):
     indent, header, body, done = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -732,15 +735,17 @@ run_start_candidate() {
       log "Found Forge installer: $inst -> running --installServer"
       # java wrapper already in PATH, and MAX_RAM/MIN_RAM exported
       "$JAVA" -jar "$inst" --installServer
-  # Some packs/placeholders drop output in subdirs; search a bit.
-  if [[ ! -f "$uni" ]]; then
-    local found_any
-    found_any="$(find . -maxdepth 3 -type f -name "${base}-universal.jar" -o -name "forge-${fv}-universal.jar" 2>/dev/null | head -n 1 || true)"
-    if [[ -n "${found_any:-}" && -f "$found_any" ]]; then
-      # Link into cwd where ServerStart.sh expects it
-      ln -sf "$found_any" "$uni" 2>/dev/null || cp -f "$found_any" "$uni" || true
-    fi
-  fi
+      rm -f "$inst" 2>/dev/null || true
+
+      # After install, re-discover start candidate
+      local next
+      next="$(find_start_candidate || true)"
+      if [[ -n "$next" && "$next" != "$cand" ]]; then
+        log "Post-install start candidate: $next"
+        run_start_candidate "$next"
+      fi
+      err "Forge installer finished but no runnable start method was produced."
+      exit 1
       ;;
     FORGE_ARGS::* )
       local unix_args="${cand#FORGE_ARGS::}"
@@ -965,6 +970,40 @@ start_server() {
       # Apply preflight BEFORE sanitizing: fixes legacy Forge jar names (e.g. SkyFactory 4)
       # and strips auto-restart loops before we exec the script.
       preflight_start_script "$s"
+
+      # Post-preflight safety check: if the script references a forge jar that still
+      # doesn't exist (download/install failed), try one more bootstrap attempt.
+      local missing_jar=""
+      missing_jar="$(grep -Eo 'forge-[0-9][^"'"'"'[:space:]{}$]+\.jar' "$s" 2>/dev/null | head -n1 || true)"
+      if [[ -n "${missing_jar:-}" && ! -f "$missing_jar" ]]; then
+        warn "Start script references $missing_jar which does not exist; attempting forge bootstrap..."
+        # Try to find or create the jar
+        local fv="${missing_jar%.jar}"
+        fv="${fv#forge-}"  # e.g. 1.12.2-14.23.5.2860
+        local mc_part="${fv%%-*}"  # e.g. 1.12.2
+        local forge_part="${fv#*-}"  # e.g. 14.23.5.2860
+        if [[ -n "$mc_part" && -n "$forge_part" ]]; then
+          local inst_jar="forge-${fv}-installer.jar"
+          local inst_url="https://maven.minecraftforge.net/net/minecraftforge/forge/${fv}/${inst_jar}"
+          log "Downloading Forge installer: $inst_url"
+          if curl -fsSL --retry 3 --retry-delay 2 -o "$inst_jar" "$inst_url" 2>/dev/null; then
+            log "Running Forge --installServer..."
+            "$JAVA" -Djava.awt.headless=true -jar "$inst_jar" --installServer 2>&1 || true
+            rm -f "$inst_jar" 2>/dev/null || true
+            # Link universal jar if the exact name is still missing
+            if [[ ! -f "$missing_jar" ]]; then
+              local uni_jar="forge-${fv}-universal.jar"
+              if [[ -f "$uni_jar" ]]; then
+                ln -sf "$uni_jar" "$missing_jar" 2>/dev/null || cp -f "$uni_jar" "$missing_jar" || true
+                log "Linked $uni_jar -> $missing_jar"
+              fi
+            fi
+          else
+            warn "Failed to download Forge installer from $inst_url"
+          fi
+        fi
+      fi
+
       local tmp=".bb_tmp_start.sh"
       sanitize_start_script "$s" "$tmp"
       # Execute with bash to avoid "sh" incompatibilities
@@ -1035,7 +1074,17 @@ start_server() {
       fi
       exec "$JAVA" -jar "$j" nogui
     else
-      warn "Refusing to start non-executable jar fallback (no Main-Class): $j"
+      # Old Forge jars (1.12.2 and earlier) may use a non-standard manifest but
+      # are still launchable with -jar on the correct Java version (Java 8).
+      # Only warn and skip if we're NOT on Java 8.
+      local java_major_ver=""
+      java_major_ver="$("$JAVA" -version 2>&1 | head -n1 | grep -oE '(1\.8\.|"1\.8)' || true)"
+      if [[ -n "$java_major_ver" ]]; then
+        log "Starting via legacy Forge jar (Java 8): $j"
+        exec "$JAVA" -jar "$j" nogui
+      else
+        warn "Refusing to start non-executable jar fallback (no Main-Class): $j"
+      fi
     fi
   fi
 
