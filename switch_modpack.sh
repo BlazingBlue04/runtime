@@ -674,7 +674,7 @@ fix_legacy_forge_jar_reference() {
 
   # 1) Literal jar name with no shell variable syntax
   local literal
-  literal="$(grep -Eo 'forge-[0-9][^"'"'"'[:space:]{}$]+\.jar' "$script" | grep -v "\$" | head -n 1 || true)"
+  literal="$(grep -Eo 'forge-[0-9][^"'"'"'[:space:]{}$]+\.jar' "$script" | grep -Fv '$' | head -n 1 || true)"
   if [[ -n "${literal:-}" ]]; then
     want="$literal"
   fi
