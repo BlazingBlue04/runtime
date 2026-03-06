@@ -1253,4 +1253,19 @@ fi
 MC_VER="$(detect_mc_version)"
 LOADER="$(detect_loader)"
 
+# ---------------------------------------
+# Client mod cleaner (optional, toggle via CLEAN_CLIENT_MODS env var)
+# Set CLEAN_CLIENT_MODS=true in Pterodactyl startup variables to enable.
+# ---------------------------------------
+if [[ "${CLEAN_CLIENT_MODS:-false}" == "true" || "${CLEAN_CLIENT_MODS:-false}" == "1" ]]; then
+  if [[ -f "./clientmod_cleaner.sh" ]]; then
+    log "CLEAN_CLIENT_MODS=true — running client mod cleaner..."
+    bash ./clientmod_cleaner.sh --apply
+  else
+    warn "CLEAN_CLIENT_MODS=true but clientmod_cleaner.sh not found — skipping."
+  fi
+else
+  log "CLEAN_CLIENT_MODS not set — skipping client mod cleaner. Set to 'true' in startup vars to enable."
+fi
+
 start_server "$MC_VER" "$LOADER"
