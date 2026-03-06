@@ -1254,6 +1254,17 @@ MC_VER="$(detect_mc_version)"
 LOADER="$(detect_loader)"
 
 # ---------------------------------------
+# JVM args generator — regenerates user_jvm_args.txt based on SERVER_MEMORY
+# Ensures correct heap size even if RAM allocation changes between boots.
+# ---------------------------------------
+if [[ -f "./generate_jvm_args.sh" ]]; then
+  log "Regenerating JVM args..."
+  bash ./generate_jvm_args.sh
+else
+  warn "generate_jvm_args.sh not found — skipping JVM args generation. user_jvm_args.txt will not be updated."
+fi
+
+# ---------------------------------------
 # Client mod cleaner (optional, toggle via CLEAN_CLIENT_MODS env var)
 # Set CLEAN_CLIENT_MODS=true in Pterodactyl startup variables to enable.
 # ---------------------------------------
