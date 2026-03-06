@@ -276,8 +276,15 @@ if [[ -z "${CF_PROJECT_ID}" && "$current_key" =~ ^curseforge:([0-9]+): ]]; then
   debug "CF_PROJECT_ID inferred from lock: $CF_PROJECT_ID"
 fi
 
-# Desired key (minimal on purpose; include project+file ids so swaps trigger)
-desired_key="${PROVIDER:-unknown}::${PACK_ID_NORM:-}::${VERSION_ID_NORM:-latest}"
+# Desired key (include MC_VERSION for vanilla/paper so version changes trigger reinstall)
+case "${PROVIDER:-unknown}" in
+  vanilla|paper|fabric|forge|neoforge)
+    desired_key="${PROVIDER:-unknown}::${MC_VERSION:-latest}::${VERSION_ID_NORM:-latest}"
+    ;;
+  *)
+    desired_key="${PROVIDER:-unknown}::${PACK_ID_NORM:-}::${VERSION_ID_NORM:-latest}"
+    ;;
+esac
 
 log "Current key: $current_key"
 log "Desired key: $desired_key"
@@ -314,6 +321,11 @@ if [[ "$need_reinstall" -eq 1 && "$PROVIDER" == "curseforge" && -z "${CF_PROJECT
   err "CURSEFORGE project id is not set. Set PACK_ID (or CF_PROJECT_ID / CURSEFORGE_PROJECT_ID / MODPACK_ID)."
   err "Example: CF_PROJECT_ID=905973 (Pokehaan Craft 2)"
   exit 64
+fi
+
+# For vanilla/paper, MC_VERSION must be set (or defaulting to latest is fine)
+if [[ "$need_reinstall" -eq 1 && ( "$PROVIDER" == "vanilla" || "$PROVIDER" == "paper" ) ]]; then
+  log "Provider is $PROVIDER — will download fresh server jar (mc=${MC_VERSION:-latest})."
 fi
 
 # ---------------------------------------
@@ -359,6 +371,63 @@ run_installer() {
         exit 1
       fi
       ./curseforge_install.sh "${CF_PROJECT_ID}" "${CF_FILE_ID}" "${CF_VERSION_ID}"
+      ;;
+    vanilla)
+      local mc_ver="${MC_VERSION:-latest}"
+      log "Installing vanilla server (mc=$mc_ver)..."
+      if [[ "$mc_ver" == "latest" ]]; then
+        # Fetch latest release version from Mojang
+        mc_ver="$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
+          | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"])' 2>/dev/null || echo "")"
+        if [[ -z "$mc_ver" ]]; then
+          err "Could not determine latest Minecraft version from Mojang."
+          exit 1
+        fi
+        log "Resolved latest vanilla version: $mc_ver"
+      fi
+      # Fetch server jar URL for this version
+      local manifest_url jar_url
+      manifest_url="$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); v=next((x for x in d['versions'] if x['id']=='${mc_ver}'),None); print(v['url'] if v else '')" 2>/dev/null || echo "")"
+      if [[ -z "$manifest_url" ]]; then
+        err "Could not find version manifest for minecraft $mc_ver."
+        exit 1
+      fi
+      jar_url="$(curl -fsSL "$manifest_url" 2>/dev/null \
+        | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["downloads"]["server"]["url"])' 2>/dev/null || echo "")"
+      if [[ -z "$jar_url" ]]; then
+        err "Could not find server jar URL for minecraft $mc_ver."
+        exit 1
+      fi
+      log "Downloading vanilla server jar: $jar_url"
+      curl -fsSL --retry 3 --retry-delay 2 -o server.jar "$jar_url"
+      log "Vanilla $mc_ver installed."
+      ;;
+    paper)
+      local mc_ver="${MC_VERSION:-latest}"
+      log "Installing Paper server (mc=$mc_ver)..."
+      if [[ "$mc_ver" == "latest" ]]; then
+        mc_ver="$(curl -fsSL https://api.papermc.io/v2/projects/paper 2>/dev/null \
+          | python3 -c 'import sys,json; d=json.load(sys.stdin); vs=d.get("versions",[]); print(vs[-1] if vs else "")' 2>/dev/null || echo "")"
+        if [[ -z "$mc_ver" ]]; then
+          err "Could not determine latest Paper version."
+          exit 1
+        fi
+        log "Resolved latest Paper mc version: $mc_ver"
+      fi
+      # Get latest build for this mc version
+      local build
+      build="$(curl -fsSL "https://api.papermc.io/v2/projects/paper/versions/${mc_ver}" 2>/dev/null \
+        | python3 -c 'import sys,json; d=json.load(sys.stdin); bs=d.get("builds",[]); print(bs[-1] if bs else "")' 2>/dev/null || echo "")"
+      if [[ -z "$build" ]]; then
+        err "Could not determine latest Paper build for mc $mc_ver."
+        exit 1
+      fi
+      local paper_jar="paper-${mc_ver}-${build}.jar"
+      local paper_url="https://api.papermc.io/v2/projects/paper/versions/${mc_ver}/builds/${build}/downloads/${paper_jar}"
+      log "Downloading Paper $mc_ver build $build: $paper_url"
+      curl -fsSL --retry 3 --retry-delay 2 -o server.jar "$paper_url"
+      log "Paper $mc_ver build $build installed."
       ;;
     *)
       err "Unsupported provider: $PROVIDER"
