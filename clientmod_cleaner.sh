@@ -49,10 +49,11 @@ CLIENT_ONLY_PATTERNS=(
   "iris*"
   "optifine*"
   "optifabric*"
+  "EuphoriaPatcher*"
   "euphoria_patcher*"
   "gpumemleakfix*"
   "betterfpsdist*"
-  "canary*"                  # client render optimiser
+  # NOTE: canary and chloride are server-safe performance mods — do NOT add them here
 
   # --- ENTITY VISUALS ---
   "entity_texture_features*"
@@ -62,25 +63,42 @@ CLIENT_ONLY_PATTERNS=(
   "3dskinlayers*"
   "not-enough-animations*"
   "animation_overhaul*"
-  "playeranimator*"          # comment out if mods depend on it server-side
   "visuality*"
   "itemphysiclite*"
+  "SubtleEffects*"
   "subtle_effects*"
+
+  # --- CAMERA / VIEW MODS ---
+  "ShoulderSurfing*"
+  "shouldersurfing*"
+  "auto_third_person*"
 
   # --- HUD / GUI MODS ---
   "legendarytooltips*"
   "itemborders*"
   "overflowingbars*"
+  "OverflowingBars*"
   "DetailArmorBar*"
   "HealthOverlay*"
   "fancymenu*"
   "bhmenu*"
+  "BHMenu*"
   "catalogue*"
   "defaultoptions*"
   "lootbeams*"
   "toastcontrol*"
+  "ToastControl*"
+  "Titles*"                  # title display mod, client-only
+  "TravelersTitles*"
+  "travelerstitles*"
+  "BetterAdvancements*"
+  "betteradvancements*"
+  "StylishEffects*"
+  "stylisheffects*"
+  "light-overlay*"
+  "lightoverlay*"
 
-  # --- MINIMAP / WORLD MAP (client-only, safe to remove) ---
+  # --- MINIMAP / WORLD MAP ---
   # NOTE: Xaeros mods CAN be kept if you want server-side waypoint sync
   # Comment these out if you use Xaeros server sync features
   "Xaeros_Minimap*"
@@ -91,27 +109,35 @@ CLIENT_ONLY_PATTERNS=(
   # --- SOUND / ATMOSPHERE ---
   "ambientsounds*"
   "extremesoundmuffler*"
+  "ExtremeSoundMuffler*"
+  "Pretty*Rain*"
   "particlerain*"
   "immersive_melodies*"
 
   # --- COSMETICS ---
+  "CosmeticArmorReworked*"
   "cosmeticarmorreworked*"
+  "CosmeticArmours*"
   "cosmeticarmoursmod*"
   "simplehats*"
   "usefulhats*"
 
-  # --- PURELY CLIENT LIBRARIES (only needed when above mods are present) ---
-  "iceberg*"                 # comment out if other mods need it server-side
-  "prism*"                   # comment out if other mods need it server-side
+  # --- CLIENT-ONLY DEPENDENCY MODS ---
+  # These are required by client mods above but crash if kept without their dependents
+  "iceberg*"                 # required by highlighter + merchantmarkers (both client-only)
+  "Highlighter*"             # client-only HUD mod, requires iceberg
+  "highlighter*"
+  "MerchantMarkers*"         # client-only HUD mod, requires iceberg
+  "merchantmarkers*"
+  "prism*"                   # client-only colour library
 
   # --- VISUAL KEYBINDING / CONTROLS ---
   "visual_keybinder*"
   "controlling*"
-  "auto_third_person*"
+  "Controlling*"
 
   # --- PERFORMANCE (client-only variants) ---
   "immediatelyfast*"
-  "chloride*"
 
 )
 
