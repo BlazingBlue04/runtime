@@ -439,9 +439,7 @@ run_installer() {
         exit 1
       fi
       if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(echo "$paper_versions_json" | python3 -c \
-          'import sys,json; d=json.load(sys.stdin); vs=d.get("versions",[]); print(vs[-1] if vs else "")' \
-          2>/dev/null || true)"
+        mc_ver="$(echo "$paper_versions_json" | grep -o '"versions":\[[^]]*\]' | grep -o '"[0-9][^"]*"' | tail -1 | tr -d '"' || true)"
         if [[ -z "$mc_ver" ]]; then
           err "Could not parse latest Paper mc version."
           exit 1
@@ -451,9 +449,7 @@ run_installer() {
       local builds_json build
       builds_json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 15 \
         "https://api.papermc.io/v2/projects/paper/versions/${mc_ver}" 2>/dev/null || true)"
-      build="$(echo "$builds_json" | python3 -c \
-        'import sys,json; d=json.load(sys.stdin); bs=d.get("builds",[]); print(bs[-1] if bs else "")' \
-        2>/dev/null || true)"
+      build="$(echo "$builds_json" | grep -o '"builds":\[[^]]*\]' | grep -o '[0-9]*' | tail -1 || true)"
       if [[ -z "$build" ]]; then
         err "Could not determine latest Paper build for mc $mc_ver."
         exit 1
