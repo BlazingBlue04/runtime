@@ -230,6 +230,30 @@ LOCK_FILE=".modpack.lock"
 normalize_egg_env
 force_java_override
 
+# ---------------------------------------
+# Self-update: re-download runtime scripts from GitHub on every boot
+# This ensures fixes pushed to GitHub are picked up automatically.
+# ---------------------------------------
+RUNTIME_RAW_BASE="${RUNTIME_RAW_BASE:-https://raw.githubusercontent.com/BlazingBlue04/runtime/main}"
+RUNTIME_SCRIPTS=(
+  "clientmod_cleaner.sh"
+  "generate_jvm_args.sh"
+)
+
+for _script in "${RUNTIME_SCRIPTS[@]}"; do
+  _url="${RUNTIME_RAW_BASE}/${_script}"
+  if curl -fsSL --retry 3 --retry-delay 2 --max-time 10 "$_url" -o "./${_script}.tmp" 2>/dev/null; then
+    sed -i 's/\r$//' "./${_script}.tmp" 2>/dev/null || true
+    mv "./${_script}.tmp" "./${_script}"
+    chmod +x "./${_script}"
+    log "Updated ${_script} from GitHub"
+  else
+    rm -f "./${_script}.tmp"
+    log "WARN: Could not update ${_script} from GitHub — using existing version"
+  fi
+done
+unset _script _url
+
 # If using CurseForge, map normalized PACK_ID into the legacy var name used by older code paths.
 if [[ "${PROVIDER:-}" == "curseforge" ]]; then
   if [[ -z "${CF_PROJECT_ID:-}" && -n "${PACK_ID_NORM:-}" ]]; then
