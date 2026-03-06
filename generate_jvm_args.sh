@@ -14,7 +14,16 @@
 
 set -euo pipefail
 
-OUTPUT="${SERVER_DIR:-/home/container}/user_jvm_args.txt"
+# During install, SERVER_DIR may not exist yet — fall back to current directory
+if [[ -n "${SERVER_DIR:-}" && -d "${SERVER_DIR}" ]]; then
+  OUTPUT="${SERVER_DIR}/user_jvm_args.txt"
+elif [[ -d "/home/container" ]]; then
+  OUTPUT="/home/container/user_jvm_args.txt"
+elif [[ -d "/mnt/server" ]]; then
+  OUTPUT="/mnt/server/user_jvm_args.txt"
+else
+  OUTPUT="./user_jvm_args.txt"
+fi
 
 log() { echo "[jvm_args] $*"; }
 
