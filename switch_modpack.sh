@@ -260,6 +260,26 @@ for _script in "${RUNTIME_SCRIPTS[@]}"; do
 done
 unset _script _url
 
+# Self-update switch_modpack.sh and re-exec if it changed (only once per boot)
+if [[ "${BB_SELF_UPDATED:-0}" != "1" ]]; then
+  _self_url="${RUNTIME_RAW_BASE}/switch_modpack.sh"
+  if curl -fsSL --retry 3 --retry-delay 2 --max-time 10 "$_self_url" -o "./switch_modpack.sh.tmp" 2>/dev/null; then
+    sed -i 's/\r$//' "./switch_modpack.sh.tmp" 2>/dev/null || true
+    if ! diff -q "./switch_modpack.sh.tmp" "./switch_modpack.sh" >/dev/null 2>&1; then
+      mv "./switch_modpack.sh.tmp" "./switch_modpack.sh"
+      chmod +x "./switch_modpack.sh"
+      log "switch_modpack.sh updated from GitHub — re-execing..."
+      export BB_SELF_UPDATED=1
+      exec bash "./switch_modpack.sh"
+    else
+      rm -f "./switch_modpack.sh.tmp"
+    fi
+  else
+    rm -f "./switch_modpack.sh.tmp"
+    log "WARN: Could not update switch_modpack.sh from GitHub — using existing version"
+  fi
+fi
+
 # If using CurseForge, map normalized PACK_ID into the legacy var name used by older code paths.
 if [[ "${PROVIDER:-}" == "curseforge" ]]; then
   if [[ -z "${CF_PROJECT_ID:-}" && -n "${PACK_ID_NORM:-}" ]]; then
@@ -386,8 +406,9 @@ run_installer() {
       log "Manifest fetched (${#manifest_json} bytes)"
       if [[ "$mc_ver" == "latest" ]]; then
         mc_ver="$(echo "$manifest_json" | python3 -c \
-          'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"])' 2>/dev/null \
-          | tr -d '\r\n' | xargs)" || true
+          'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"].strip())' \
+          2>/dev/null | tr -d '\r\n' | xargs)" || true
+        log "Parsed mc_ver='$mc_ver'"
         if [[ -z "$mc_ver" ]]; then
           # grep fallback (handles spaces around colon)
           mc_ver="$(echo "$manifest_json" | grep -oP '"release"\s*:\s*"\K[^"]+' \
