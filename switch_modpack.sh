@@ -418,11 +418,6 @@ run_installer() {
       local version_url
       version_url="$(echo "$manifest_json" | jq -r --arg v "$mc_ver" '.versions[] | select(.id==$v) | .url' | head -n1)"
       if [[ -z "$version_url" ]]; then
-        # grep fallback
-        version_url="$(echo "$manifest_json" | grep -o "\"id\"[[:space:]]*:[[:space:]]*\"${mc_ver}\"[^}]*\"url\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
-          | grep -o '"url"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"' || true)"
-      fi
-      if [[ -z "$version_url" ]]; then
         err "Could not find version manifest URL for minecraft $mc_ver."
         exit 1
       fi
@@ -505,7 +500,7 @@ detect_mc_version() {
 
   # Fallback: parse from manifest.json if present
   if [[ -z "$v" && -f "./manifest.json" ]]; then
-    v="$(python3 -c 'import json; j=json.load(open("manifest.json")); print(j.get("minecraft",{}).get("version",""))' 2>/dev/null || true)"
+    v="$(jq -r '.minecraft.version // empty' manifest.json 2>/dev/null || true)"
     if [[ -z "$v" ]]; then
       v="$(jq -r '.minecraft.version // empty' manifest.json 2>/dev/null || true)"
     fi
@@ -530,9 +525,6 @@ detect_loader() {
   if [[ -f "./manifest.json" ]]; then
     local lid=""
     lid="$(jq -r '(.minecraft.modLoaders[0].id // empty)' manifest.json 2>/dev/null || true)"
-    if [[ -z "$lid" ]]; then
-      lid="$(python3 -c 'import json; j=json.load(open("manifest.json")); ml=j.get("minecraft",{}).get("modLoaders",[]); print(ml[0]["id"] if ml else "")' 2>/dev/null || true)"
-    fi
     case "$lid" in
       forge-*) echo "forge"; return ;;
       neoforge-*) echo "neoforge"; return ;;
