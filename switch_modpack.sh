@@ -405,23 +405,19 @@ run_installer() {
       fi
       log "Manifest fetched (${#manifest_json} bytes)"
       if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(echo "$manifest_json" | python3 -c \
-          'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"].strip())' \
-          2>/dev/null | tr -d '\r\n' | xargs)" || true
-        log "Parsed mc_ver='$mc_ver'"
-        if [[ -z "$mc_ver" ]]; then
-          # grep fallback (handles spaces around colon)
-          mc_ver="$(echo "$manifest_json" | grep -oP '"release"\s*:\s*"\K[^"]+' \
-            | head -1 | tr -d '\r\n' | xargs || true)"
-        fi
-        log "Parsed mc_ver='$mc_ver'"
-        if [[ -z "$mc_ver" ]]; then
-          err "Could not parse latest Minecraft version from Mojang manifest."
-          log "First 200 chars of manifest: ${manifest_json:0:200}"
-          exit 1
-        fi
-        log "Resolved latest vanilla version: $mc_ver"
-      fi
+  mc_ver="$(echo "$manifest_json" | python3 -c \
+    'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"].strip())' \
+    2>/dev/null | tr -d '\r\n' | xargs)" || true
+  log "Parsed mc_ver='$mc_ver'"
+  if [[ -z "$mc_ver" ]]; then
+    # Debug: try without 2>/dev/null to see the actual python3 error
+    log "python3 debug: $(echo "$manifest_json" | python3 -c \
+      'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"].strip())' 2>&1 | head -3)"
+    err "Could not parse latest Minecraft version from Mojang manifest."
+    exit 1
+  fi
+  log "Resolved latest vanilla version: $mc_ver"
+fi
       # Fetch version-specific manifest URL
       local version_url
       version_url="$(echo "$manifest_json" | python3 -c \
