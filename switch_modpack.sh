@@ -66,7 +66,7 @@ normalize_egg_env() {
 # -----------------------------
 force_java_override() {
   local maj="${JAVA_MAJOR:-}"
-  if [[ -z "$maj" ]]; then return 0; fi
+  if [[ -z "$maj" || "$maj" == "none" || "$maj" == "auto" ]]; then return 0; fi
   case "$maj" in
     8|11|17|21)
       if [[ -x "/opt/java/${maj}/bin/java" ]]; then
@@ -386,11 +386,12 @@ run_installer() {
       log "Manifest fetched (${#manifest_json} bytes)"
       if [[ "$mc_ver" == "latest" ]]; then
         mc_ver="$(echo "$manifest_json" | python3 -c \
-          'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"])' 2>/dev/null)" || true
+          'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"])' 2>/dev/null \
+          | tr -d '\r\n' | xargs)" || true
         if [[ -z "$mc_ver" ]]; then
           # grep fallback (handles spaces around colon)
-          mc_ver="$(echo "$manifest_json" | grep -o '"release"[[:space:]]*:[[:space:]]*"[^"]*"' \
-            | head -1 | grep -o '"[^"]*"$' | tr -d '"' || true)"
+          mc_ver="$(echo "$manifest_json" | grep -oP '"release"\s*:\s*"\K[^"]+' \
+            | head -1 | tr -d '\r\n' | xargs || true)"
         fi
         log "Parsed mc_ver='$mc_ver'"
         if [[ -z "$mc_ver" ]]; then
@@ -1393,12 +1394,19 @@ fi
 # Set CLEAN_CLIENT_MODS=true in Pterodactyl startup variables to enable.
 # ---------------------------------------
 if [[ "${CLEAN_CLIENT_MODS:-false}" == "true" || "${CLEAN_CLIENT_MODS:-false}" == "1" ]]; then
-  if [[ -f "./clientmod_cleaner.sh" ]]; then
-    log "CLEAN_CLIENT_MODS=true — running client mod cleaner..."
-    bash ./clientmod_cleaner.sh --apply
-  else
-    warn "CLEAN_CLIENT_MODS=true but clientmod_cleaner.sh not found — skipping."
-  fi
+  case "${PROVIDER:-}" in
+    vanilla|paper|bedrock)
+      log "CLEAN_CLIENT_MODS=true but provider=${PROVIDER} has no mods — skipping client mod cleaner."
+      ;;
+    *)
+      if [[ -f "./clientmod_cleaner.sh" ]]; then
+        log "CLEAN_CLIENT_MODS=true — running client mod cleaner..."
+        bash ./clientmod_cleaner.sh --apply
+      else
+        warn "CLEAN_CLIENT_MODS=true but clientmod_cleaner.sh not found — skipping."
+      fi
+      ;;
+  esac
 else
   log "CLEAN_CLIENT_MODS not set — skipping client mod cleaner. Set to 'true' in startup vars to enable."
 fi
