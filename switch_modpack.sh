@@ -405,24 +405,18 @@ run_installer() {
       fi
       log "Manifest fetched (${#manifest_json} bytes)"
       if [[ "$mc_ver" == "latest" ]]; then
-  mc_ver="$(echo "$manifest_json" | python3 -c \
-    'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"].strip())' \
-    2>/dev/null | tr -d '\r\n' | xargs)" || true
-  log "Parsed mc_ver='$mc_ver'"
-  if [[ -z "$mc_ver" ]]; then
-    # Debug: try without 2>/dev/null to see the actual python3 error
-    log "python3 debug: $(echo "$manifest_json" | python3 -c \
-      'import sys,json; d=json.load(sys.stdin); print(d["latest"]["release"].strip())' 2>&1 | head -3)"
-    err "Could not parse latest Minecraft version from Mojang manifest."
-    exit 1
-  fi
-  log "Resolved latest vanilla version: $mc_ver"
-fi
+        mc_ver="$(echo "$manifest_json" | jq -r '.latest.release // empty' | tr -d '\r\n' | xargs)"
+        log "Parsed mc_ver='$mc_ver'"
+        if [[ -z "$mc_ver" ]]; then
+          err "Could not parse latest Minecraft version from Mojang manifest."
+          log "First 200 chars of manifest: ${manifest_json:0:200}"
+          exit 1
+        fi
+        log "Resolved latest vanilla version: $mc_ver"
+      fi
       # Fetch version-specific manifest URL
       local version_url
-      version_url="$(echo "$manifest_json" | python3 -c \
-        "import sys,json; d=json.load(sys.stdin); v=next((x for x in d['versions'] if x['id']=='${mc_ver}'),None); print(v['url'] if v else '')" \
-        2>/dev/null)" || true
+      version_url="$(echo "$manifest_json" | jq -r --arg v "$mc_ver" '.versions[] | select(.id==$v) | .url' | head -n1)"
       if [[ -z "$version_url" ]]; then
         # grep fallback
         version_url="$(echo "$manifest_json" | grep -o "\"id\"[[:space:]]*:[[:space:]]*\"${mc_ver}\"[^}]*\"url\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
@@ -435,9 +429,7 @@ fi
       # Fetch server jar URL
       local version_manifest jar_url
       version_manifest="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 15 "$version_url" 2>/dev/null || true)"
-      jar_url="$(echo "$version_manifest" | python3 -c \
-        'import sys,json; d=json.load(sys.stdin); print(d["downloads"]["server"]["url"])' \
-        2>/dev/null)" || true
+      jar_url="$(echo "$version_manifest" | jq -r '.downloads.server.url // empty')"
       if [[ -z "$jar_url" ]]; then
         err "Could not find server jar URL for minecraft $mc_ver."
         exit 1
