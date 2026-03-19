@@ -57,14 +57,26 @@ json_get() {
 
 echo "[curseforge] Retrieving project info for ${PACK_ID}..."
 MOD_JSON="$(req_json "/v1/mods/${PACK_ID}")"
+
+# Validate pack exists before we do anything destructive
+if [[ -z "$MOD_JSON" ]] || echo "$MOD_JSON" | json_get '.data' | grep -q "null"; then
+  die "Pack ID ${PACK_ID} not found on CurseForge. Check PACK_ID is correct before reinstalling."
+fi
+
 MOD_NAME="$(echo "$MOD_JSON" | json_get '.data.name // empty')"
 MAIN_FILE_ID="$(echo "$MOD_JSON" | json_get '.data.mainFileId // empty')"
+echo "[curseforge] Found pack: ${MOD_NAME} (id=${PACK_ID})"
 
 if [[ "${VERSION_ID}" == "latest" || -z "${VERSION_ID}" ]]; then
   [[ -n "${MAIN_FILE_ID}" && "${MAIN_FILE_ID}" != "0" && "${MAIN_FILE_ID}" != "null" ]] || die "Pack does not expose a mainFileId; choose a specific file/version."
   VERSION_ID="${MAIN_FILE_ID}"
   echo "[curseforge] VERSION_ID=latest -> using mainFileId ${VERSION_ID}"
 fi
+
+# Store resolved file ID so switch_modpack.sh can use it in the lock key
+# This prevents "latest" from triggering a reinstall on every restart
+echo "${VERSION_ID}" > ".bb_resolved_file_id"
+echo "[curseforge] Resolved file ID: ${VERSION_ID}"
 
 echo "[curseforge] Checking file id '${VERSION_ID}' exists..."
 FILE_URL="${CF_API}/v1/mods/${PACK_ID}/files/${VERSION_ID}"
@@ -504,3 +516,21 @@ ensure_forge_jar_for_scripts
 download_mods_from_manifest_if_needed
 
 echo "[curseforge] Install complete."
+
+# Write initial pack info for the website Version tab
+# switch_modpack.sh will overwrite this with more complete info on boot
+python3 -c "
+import json, datetime
+info = {
+  'provider':     'curseforge',
+  'pack_id':      '${PACK_ID}',
+  'file_id':      '${VERSION_ID}',
+  'pack_name':    '${MOD_NAME}',
+  'pack_version': '',
+  'mc_version':   '',
+  'loader':       '',
+  'updated_at':   datetime.datetime.utcnow().isoformat() + 'Z',
+}
+json.dump(info, open('.bb_pack_info.json','w'), indent=2)
+print('[curseforge] Pack info written to .bb_pack_info.json')
+" 2>/dev/null || true
