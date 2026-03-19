@@ -93,11 +93,19 @@ install_mrpack() {
 
   local files_json="${SERVER_DIR}/.bb_mr_unpack/modrinth.index.json"
   jq -c '.files[]' "$files_json" | while read -r item; do
-    local path url sha1
+    local path url sha1 env_server
     path="$(echo "$item" | jq -r '.path // empty')"
     url="$(echo "$item"  | jq -r '.downloads[0] // empty')"
     sha1="$(echo "$item" | jq -r '.hashes.sha1 // empty')"
+    # Check server environment — skip mods marked unsupported on server
+    env_server="$(echo "$item" | jq -r '.env.server // "required"' 2>/dev/null || echo "required")"
     [[ -n "$path" && -n "$url" ]] || continue
+
+    # Skip client-only mods (env.server = "unsupported")
+    if [[ "$env_server" == "unsupported" ]]; then
+      echo "[modrinth] Skipping client-only mod (env.server=unsupported): $(basename "$path")"
+      continue
+    fi
 
     mkdir -p "$(dirname "${SERVER_DIR}/${path}")" || true
 
