@@ -241,9 +241,14 @@ force_java_override
 # This ensures fixes pushed to GitHub are picked up automatically.
 # ---------------------------------------
 RUNTIME_RAW_BASE="${RUNTIME_RAW_BASE:-https://raw.githubusercontent.com/BlazingBlue04/runtime/main}"
+
+# Also self-update the installer scripts so fixes propagate to existing servers
 RUNTIME_SCRIPTS=(
   "clientmod_cleaner.sh"
   "generate_jvm_args.sh"
+  "curseforge_install.sh"
+  "modrinth_install.sh"
+  "ftb_install.sh"
 )
 
 for _script in "${RUNTIME_SCRIPTS[@]}"; do
@@ -260,8 +265,11 @@ for _script in "${RUNTIME_SCRIPTS[@]}"; do
 done
 unset _script _url
 
-# Self-update switch_modpack.sh and re-exec if it changed (only once per boot)
-if [[ "${BB_SELF_UPDATED:-0}" != "1" ]]; then
+# Self-update switch_modpack.sh and re-exec if it changed.
+# Use a file flag (.bb_self_updated) instead of an env var — env vars are not
+# reliably inherited across exec on all systems, which can cause an infinite loop.
+BB_SELF_UPDATED_FLAG=".bb_self_updated"
+if [[ ! -f "$BB_SELF_UPDATED_FLAG" ]]; then
   _self_url="${RUNTIME_RAW_BASE}/switch_modpack.sh"
   if curl -fsSL --retry 3 --retry-delay 2 --max-time 10 "$_self_url" -o "./switch_modpack.sh.tmp" 2>/dev/null; then
     sed -i 's/\r$//' "./switch_modpack.sh.tmp" 2>/dev/null || true
@@ -269,7 +277,7 @@ if [[ "${BB_SELF_UPDATED:-0}" != "1" ]]; then
       mv "./switch_modpack.sh.tmp" "./switch_modpack.sh"
       chmod +x "./switch_modpack.sh"
       log "switch_modpack.sh updated from GitHub — re-execing..."
-      export BB_SELF_UPDATED=1
+      touch "$BB_SELF_UPDATED_FLAG"
       exec bash "./switch_modpack.sh"
     else
       rm -f "./switch_modpack.sh.tmp"
@@ -279,6 +287,8 @@ if [[ "${BB_SELF_UPDATED:-0}" != "1" ]]; then
     log "WARN: Could not update switch_modpack.sh from GitHub — using existing version"
   fi
 fi
+# Always clean up the flag at the end of the self-update block so next boot re-checks
+rm -f "$BB_SELF_UPDATED_FLAG" 2>/dev/null || true
 
 # If using CurseForge, map normalized PACK_ID into the legacy var name used by older code paths.
 if [[ "${PROVIDER:-}" == "curseforge" ]]; then
@@ -322,6 +332,12 @@ case "${PROVIDER:-unknown}" in
     ;;
   curseforge)
     desired_key="curseforge::${PACK_ID_NORM:-}::${RESOLVED_VERSION_ID}"
+    ;;
+  modrinth|ftb)
+    desired_key="${PROVIDER:-unknown}::${PACK_ID_NORM:-}::${VERSION_ID_NORM:-latest}"
+    ;;
+  bedrock)
+    desired_key="bedrock::${BEDROCK_VERSION:-latest}::${BEDROCK_CHANNEL:-release}"
     ;;
   *)
     desired_key="${PROVIDER:-unknown}::${PACK_ID_NORM:-}::${VERSION_ID_NORM:-latest}"
@@ -393,7 +409,27 @@ deep_wipe() {
     mv "$x" ./ 2>/dev/null || true
   done
   shopt -u dotglob nullglob
+
+  # restore
+  shopt -s dotglob nullglob
+  for x in .bb_tmp_preserve/*; do
+    mv "$x" ./ 2>/dev/null || true
+  done
+  shopt -u dotglob nullglob
   rm -rf .bb_tmp_preserve || true
+
+  # Re-download any runtime scripts that didn't survive the wipe
+  # (shouldn't happen since we preserve them above, but safety net)
+  local _raw="${RUNTIME_RAW_BASE:-https://raw.githubusercontent.com/BlazingBlue04/runtime/main}"
+  for _s in switch_modpack.sh curseforge_install.sh modrinth_install.sh ftb_install.sh clientmod_cleaner.sh generate_jvm_args.sh; do
+    if [[ ! -f "./$_s" ]]; then
+      log "WARN: $_s missing after wipe — re-downloading from GitHub..."
+      curl -fsSL --retry 3 --retry-delay 2 --max-time 15 "$_raw/$_s" -o "./$_s" 2>/dev/null \
+        && sed -i 's/\r$//' "./$_s" && chmod +x "./$_s" \
+        || log "ERROR: Could not re-download $_s — install may fail"
+    fi
+  done
+  unset _s _raw
 }
 
 # ---------------------------------------
@@ -407,7 +443,10 @@ run_installer() {
         err "curseforge_install.sh missing or not executable."
         exit 1
       fi
-      ./curseforge_install.sh "${CF_PROJECT_ID}" "${CF_FILE_ID}" "${CF_VERSION_ID}"
+      # Export the resolved vars so curseforge_install.sh can read them from env
+      export PACK_ID="${PACK_ID_NORM:-${CF_PROJECT_ID:-}}"
+      export VERSION_ID="${VERSION_ID_NORM:-${CF_FILE_ID:-latest}}"
+      ./curseforge_install.sh
       ;;
     vanilla)
       local mc_ver="${MC_VERSION:-latest}"
@@ -481,10 +520,183 @@ run_installer() {
       curl -fsSL --retry 3 --retry-delay 2 --max-time 120 -o server.jar "$paper_url"
       log "Paper $mc_ver build $build installed."
       ;;
+    modrinth)
+      if [[ ! -x "./modrinth_install.sh" ]]; then
+        err "modrinth_install.sh missing or not executable."
+        exit 1
+      fi
+      export PACK_ID="${PACK_ID_NORM:-}"
+      export VERSION_ID="${VERSION_ID_NORM:-latest}"
+      ./modrinth_install.sh
+      ;;
+    ftb)
+      if [[ ! -x "./ftb_install.sh" ]]; then
+        err "ftb_install.sh missing or not executable."
+        exit 1
+      fi
+      export PACK_ID="${PACK_ID_NORM:-}"
+      export VERSION_ID="${VERSION_ID_NORM:-latest}"
+      ./ftb_install.sh
+      ;;
+    bedrock)
+      local bv="${BEDROCK_VERSION:-latest}"
+      local bc="${BEDROCK_CHANNEL:-release}"
+      log "Installing Bedrock server (version=$bv channel=$bc)..."
+      local api_url="https://raw.githubusercontent.com/jhead/phantom/master/bedrock_versions.json"
+      local dl_url=""
+      if [[ "$bv" == "latest" ]]; then
+        # Try to get download URL from Mojang's download page (x86_64 Linux)
+        local page
+        page="$(curl -fsSL --retry 3 --max-time 15 \
+          "https://www.minecraft.net/en-us/download/server/bedrock" 2>/dev/null || true)"
+        dl_url="$(echo "$page" | grep -oP 'https://[^"]+bin-linux/[^"]+\.zip' | head -1 || true)"
+      fi
+      if [[ -z "$dl_url" ]]; then
+        # Fallback: direct versioned URL pattern
+        dl_url="https://minecraft.azureedge.net/bin-linux/bedrock-server-${bv}.zip"
+      fi
+      log "Downloading Bedrock server: $dl_url"
+      curl -fsSL --retry 3 --max-time 120 -o bedrock-server.zip "$dl_url" \
+        || { err "Failed to download Bedrock server from $dl_url"; exit 1; }
+      unzip -o bedrock-server.zip -d . && rm -f bedrock-server.zip
+      chmod +x bedrock_server 2>/dev/null || true
+      log "Bedrock server installed."
+      ;;
+    fabric)
+      local mc_ver="${MC_VERSION:-latest}"
+      local loader_ver="${FABRIC_LOADER_VERSION:-latest}"
+      local inst_ver="${FABRIC_INSTALLER_VERSION:-latest}"
+      log "Installing Fabric server (mc=$mc_ver loader=$loader_ver)..."
+
+      # Resolve latest MC version
+      if [[ "$mc_ver" == "latest" ]]; then
+        mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
+          | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latest']['release'])" 2>/dev/null || true)"
+        [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
+        log "Resolved latest MC version: $mc_ver"
+      fi
+
+      # Resolve latest Fabric installer version
+      if [[ "$inst_ver" == "latest" ]]; then
+        inst_ver="$(curl -fsSL --retry 3 --max-time 15 \
+          https://maven.fabricmc.net/net/fabricmc/fabric-installer/maven-metadata.xml 2>/dev/null \
+          | grep -oP '(?<=<release>)[^<]+' | head -1 || true)"
+        inst_ver="${inst_ver:-1.0.1}"
+        log "Resolved Fabric installer version: $inst_ver"
+      fi
+
+      local inst_url="https://maven.fabricmc.net/net/fabricmc/fabric-installer/${inst_ver}/fabric-installer-${inst_ver}.jar"
+      log "Downloading Fabric installer: $inst_url"
+      curl -fsSL --retry 3 --max-time 60 -o fabric-installer.jar "$inst_url" \
+        || { err "Failed to download Fabric installer."; exit 1; }
+
+      local java_bin
+      java_bin="$(java_for "$mc_ver" "fabric")"
+      export PATH="$(dirname "$java_bin"):$PATH"
+      export JAVA_HOME="$(dirname "$(dirname "$java_bin")")"
+
+      "$java_bin" -Djava.awt.headless=true -jar fabric-installer.jar server \
+        -mcversion "$mc_ver" \
+        ${loader_ver:+"-loader" "$loader_ver"} \
+        -downloadMinecraft \
+        || { err "Fabric installer failed."; exit 1; }
+      rm -f fabric-installer.jar
+      log "Fabric $mc_ver installed."
+      ;;
+    forge)
+      local mc_ver="${MC_VERSION:-latest}"
+      local forge_ver="${FORGE_VERSION:-latest}"
+      log "Installing Forge server (mc=$mc_ver forge=$forge_ver)..."
+
+      if [[ "$mc_ver" == "latest" ]]; then
+        mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
+          | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latest']['release'])" 2>/dev/null || true)"
+        [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
+      fi
+
+      if [[ "$forge_ver" == "latest" || -z "$forge_ver" ]]; then
+        # Fetch latest recommended Forge version from Maven metadata
+        forge_ver="$(curl -fsSL --retry 3 --max-time 15 \
+          "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json" 2>/dev/null \
+          | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+promos=d.get('promos',{})
+key='${mc_ver}-recommended'
+if key in promos: print(promos[key])
+elif '${mc_ver}-latest' in promos: print(promos['${mc_ver}-latest'])
+" 2>/dev/null || true)"
+        if [[ -z "$forge_ver" ]]; then
+          err "Could not resolve Forge version for MC $mc_ver. Set FORGE_VERSION explicitly (e.g. 1.20.1-47.2.0)."
+          exit 1
+        fi
+        log "Resolved Forge version: $forge_ver"
+      fi
+
+      local java_bin
+      java_bin="$(java_for "$mc_ver" "forge")"
+      export PATH="$(dirname "$java_bin"):$PATH"
+      export JAVA_HOME="$(dirname "$(dirname "$java_bin")")"
+
+      local full_ver="${mc_ver}-${forge_ver}"
+      local inst_jar="forge-${full_ver}-installer.jar"
+      local inst_url="https://maven.minecraftforge.net/net/minecraftforge/forge/${full_ver}/${inst_jar}"
+      log "Downloading Forge installer: $inst_url"
+      curl -fsSL --retry 3 --max-time 120 -o "$inst_jar" "$inst_url" \
+        || { err "Failed to download Forge installer from $inst_url"; exit 1; }
+
+      "$java_bin" -Djava.awt.headless=true -jar "$inst_jar" --installServer \
+        || { err "Forge installer failed."; exit 1; }
+      rm -f "$inst_jar" 2>/dev/null || true
+      log "Forge ${full_ver} installed."
+      ;;
+    neoforge)
+      local mc_ver="${MC_VERSION:-latest}"
+      local neo_ver="${NEOFORGE_VERSION:-latest}"
+      log "Installing NeoForge server (mc=$mc_ver neo=$neo_ver)..."
+
+      if [[ "$mc_ver" == "latest" ]]; then
+        mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
+          | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latest']['release'])" 2>/dev/null || true)"
+        [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
+      fi
+
+      if [[ "$neo_ver" == "latest" || -z "$neo_ver" ]]; then
+        # NeoForge versions are like 21.1.x for MC 1.21.1 — strip leading "1."
+        local neo_mc_prefix
+        neo_mc_prefix="$(echo "$mc_ver" | sed 's/^1\.//')"
+        neo_ver="$(curl -fsSL --retry 3 --max-time 15 \
+          "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml" 2>/dev/null \
+          | grep -oP "(?<=<version>)${neo_mc_prefix}\.[0-9.]+(?=</version>)" \
+          | sort -V | tail -1 || true)"
+        if [[ -z "$neo_ver" ]]; then
+          err "Could not resolve NeoForge version for MC $mc_ver. Set NEOFORGE_VERSION explicitly (e.g. 21.1.74)."
+          exit 1
+        fi
+        log "Resolved NeoForge version: $neo_ver"
+      fi
+
+      local java_bin
+      java_bin="$(java_for "$mc_ver" "neoforge")"
+      export PATH="$(dirname "$java_bin"):$PATH"
+      export JAVA_HOME="$(dirname "$(dirname "$java_bin")")"
+
+      local inst_jar="neoforge-${neo_ver}-installer.jar"
+      local inst_url="https://maven.neoforged.net/releases/net/neoforged/neoforge/${neo_ver}/${inst_jar}"
+      log "Downloading NeoForge installer: $inst_url"
+      curl -fsSL --retry 3 --max-time 120 -o "$inst_jar" "$inst_url" \
+        || { err "Failed to download NeoForge installer from $inst_url"; exit 1; }
+
+      "$java_bin" -Djava.awt.headless=true -jar "$inst_jar" --installServer \
+        || { err "NeoForge installer failed."; exit 1; }
+      rm -f "$inst_jar" 2>/dev/null || true
+      log "NeoForge ${neo_ver} installed."
+      ;;
     *)
-      err "Unsupported provider: $PROVIDER"
+      err "Unsupported provider: $PROVIDER. Valid providers: vanilla, paper, fabric, forge, neoforge, curseforge, modrinth, ftb, bedrock"
       exit 1
       ;;
+
   esac
 }
 
