@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# clientmod_cleaner.sh — Server-side client mod remover
-# Moves client-only mods out of /mods into /mods_disabled so they can be
-# re-enabled easily. Safe to run on every startup or manually.
+# clientmod_cleaner.sh — Server-side client mod remover (v2)
+#
+# Detection priority order:
+#   1. fabric.mod.json  — "environment": "client"       (Fabric/Quilt)
+#   2. quilt.mod.json   — "environment": "client"       (Quilt)
+#   3. META-INF/mods.toml — side = "CLIENT"             (Forge/NeoForge 1.14+)
+#   4. META-INF/neoforge.mods.toml — side = "CLIENT"   (NeoForge)
+#   5. mcmod.info       — "clientSideOnly": true         (Forge 1.12 and older)
+#   6. Filename patterns — last resort fallback
 #
 # USAGE:
 #   bash clientmod_cleaner.sh            # dry run (shows what would move)
-#   bash clientmod_cleaner.sh --apply    # actually moves the mods
-#   bash clientmod_cleaner.sh --restore  # moves disabled mods back to /mods
-#
-# CONFIGURATION:
-#   Edit the CLIENT_ONLY_PATTERNS list below to add/remove patterns.
-#   Patterns are matched against the jar filename (case-insensitive glob).
+#   bash clientmod_cleaner.sh --apply    # actually move client mods to mods_disabled/
+#   bash clientmod_cleaner.sh --restore  # move disabled mods back to mods/
 # =============================================================================
 
 set -euo pipefail
@@ -19,6 +21,7 @@ set -euo pipefail
 DIR="${SERVER_DIR:-/home/container}"
 MODS_DIR="$DIR/mods"
 DISABLED_DIR="$DIR/mods_disabled"
+LOG_FILE="$DIR/.bb_client_mods.log"
 
 DRY_RUN=true
 RESTORE=false
@@ -30,132 +33,215 @@ for arg in "$@"; do
   esac
 done
 
-log()    { echo "[cleaner] $*"; }
+log()  { echo "[cleaner] $*"; }
+
 moved=0
-skipped=0
 
 # =============================================================================
-# CLIENT-ONLY MOD PATTERNS
-# Each entry is a glob pattern matched against the .jar filename.
-# Add a # comment above each group to explain what it is.
-# To DISABLE a rule (keep the mod on server), comment it out with #
+# JAR INTROSPECTION
+# =============================================================================
+
+jar_cat() {
+  local jar="$1" path="$2"
+  unzip -p "$jar" "$path" 2>/dev/null
+}
+
+jar_has() {
+  local jar="$1" path="$2"
+  unzip -l "$jar" 2>/dev/null | grep -qF "$path"
+}
+
+# =============================================================================
+# METADATA CHECKERS — each returns "client", "server", "both", or "unknown"
+# =============================================================================
+
+check_fabric_mod_json() {
+  local content="$1"
+  python3 - <<PY 2>/dev/null || echo "unknown"
+import json, sys
+try:
+    d = json.loads("""${content//\"/\\\"}""")
+    e = d.get('environment', d.get('env', ''))
+    if isinstance(e, str):
+        v = e.lower().strip()
+        if v == 'client': print('client')
+        elif v in ('server', 'dedicated_server'): print('server')
+        else: print('both')
+    elif isinstance(e, dict):
+        s = str(e.get('server', 'required')).lower()
+        c = str(e.get('client', 'required')).lower()
+        if s in ('unsupported',) and c in ('required', 'optional'):
+            print('client')
+        elif c in ('unsupported',):
+            print('server')
+        else:
+            print('both')
+    else:
+        print('unknown')
+except Exception:
+    print('unknown')
+PY
+}
+
+check_fabric_mod_json_safe() {
+  local jar="$1"
+  jar_has "$jar" "fabric.mod.json" || return 1
+  local content
+  content="$(jar_cat "$jar" "fabric.mod.json")" || return 1
+  [[ -z "$content" ]] && return 1
+  # Use python3 to parse — bash can't handle unicode/special chars in json
+  python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    e = d.get('environment', d.get('env', ''))
+    if isinstance(e, str):
+        v = e.lower().strip()
+        if v == 'client': print('client')
+        elif v in ('server', 'dedicated_server'): print('server')
+        else: print('both')
+    elif isinstance(e, dict):
+        s = str(e.get('server', 'required')).lower()
+        c = str(e.get('client', 'required')).lower()
+        if s in ('unsupported',) and c in ('required', 'optional'):
+            print('client')
+        elif c in ('unsupported',):
+            print('server')
+        else:
+            print('both')
+    else:
+        print('unknown')
+except Exception:
+    print('unknown')
+" <<< "$content" 2>/dev/null || echo "unknown"
+}
+
+check_quilt_mod_json_safe() {
+  local jar="$1"
+  jar_has "$jar" "quilt.mod.json" || return 1
+  local content
+  content="$(jar_cat "$jar" "quilt.mod.json")" || return 1
+  [[ -z "$content" ]] && return 1
+  python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    ql = d.get('quilt_loader', {})
+    e = ql.get('environment', 'universal')
+    if isinstance(e, str):
+        v = e.lower().strip()
+        if v == 'client': print('client')
+        elif v in ('server', 'dedicated_server'): print('server')
+        else: print('both')
+    else:
+        print('unknown')
+except Exception:
+    print('unknown')
+" <<< "$content" 2>/dev/null || echo "unknown"
+}
+
+check_mods_toml_safe() {
+  local jar="$1" toml_path="$2"
+  jar_has "$jar" "$toml_path" || return 1
+  local content
+  content="$(jar_cat "$jar" "$toml_path")" || return 1
+  [[ -z "$content" ]] && return 1
+  # TOML is hard to parse in bash — use grep for the side field
+  # Handles: side="CLIENT", side = "CLIENT", side='CLIENT'
+  if echo "$content" | grep -qiE '^\s*side\s*=\s*["\x27]CLIENT["\x27]'; then
+    echo "client"; return 0
+  fi
+  if echo "$content" | grep -qiE '^\s*side\s*=\s*["\x27](BOTH|SERVER)["\x27]'; then
+    echo "both"; return 0
+  fi
+  echo "unknown"
+}
+
+check_mcmod_info_safe() {
+  local jar="$1"
+  jar_has "$jar" "mcmod.info" || return 1
+  local content
+  content="$(jar_cat "$jar" "mcmod.info")" || return 1
+  [[ -z "$content" ]] && return 1
+  python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    if isinstance(d, list): d = d[0] if d else {}
+    if d.get('clientSideOnly', False): print('client')
+    else: print('both')
+except Exception:
+    print('unknown')
+" <<< "$content" 2>/dev/null || echo "unknown"
+}
+
+# =============================================================================
+# MAIN ENVIRONMENT DETECTOR
+# Returns "client", "server", "both", or "unknown"
+# =============================================================================
+detect_mod_environment() {
+  local jar="$1"
+  local result
+
+  # 1. Fabric
+  result="$(check_fabric_mod_json_safe "$jar" 2>/dev/null)" || result="unknown"
+  [[ "$result" == "client" || "$result" == "server" || "$result" == "both" ]] && { echo "$result"; return; }
+
+  # 2. Quilt
+  result="$(check_quilt_mod_json_safe "$jar" 2>/dev/null)" || result="unknown"
+  [[ "$result" == "client" || "$result" == "server" ]] && { echo "$result"; return; }
+
+  # 3. Forge/NeoForge mods.toml
+  result="$(check_mods_toml_safe "$jar" "META-INF/mods.toml" 2>/dev/null)" || result="unknown"
+  [[ "$result" == "client" || "$result" == "both" ]] && { echo "$result"; return; }
+
+  # 4. NeoForge neoforge.mods.toml
+  result="$(check_mods_toml_safe "$jar" "META-INF/neoforge.mods.toml" 2>/dev/null)" || result="unknown"
+  [[ "$result" == "client" ]] && { echo "client"; return; }
+
+  # 5. Legacy Forge mcmod.info
+  result="$(check_mcmod_info_safe "$jar" 2>/dev/null)" || result="unknown"
+  [[ "$result" == "client" ]] && { echo "client"; return; }
+
+  echo "unknown"
+}
+
+# =============================================================================
+# FILENAME PATTERN FALLBACK
+# Only for mods with no metadata at all
 # =============================================================================
 CLIENT_ONLY_PATTERNS=(
-
-  # --- RENDERING / SHADERS (never needed server-side) ---
-  "oculus*"
-  "embeddium*"
-  "rubidium*"
-  "iris*"
-  "optifine*"
-  "optifabric*"
-  "EuphoriaPatcher*"
-  "euphoria_patcher*"
-  "gpumemleakfix*"
-  "betterfpsdist*"
-  # NOTE: canary and chloride are server-safe performance mods — do NOT add them here
-
-  # --- ENTITY VISUALS ---
-  "entity_texture_features*"
-  "entity_model_features*"
-  "entityculling*"
-  "skinlayers*"
-  "3dskinlayers*"
-  "not-enough-animations*"
-  "animation_overhaul*"
-  "visuality*"
-  "itemphysiclite*"
-  "SubtleEffects*"
-  "subtle_effects*"
-
-  # --- CAMERA / VIEW MODS ---
-  "ShoulderSurfing*"
-  "shouldersurfing*"
-  "auto_third_person*"
-
-  # --- HUD / GUI MODS ---
-  "legendarytooltips*"
-  "itemborders*"
-  "overflowingbars*"
-  "OverflowingBars*"
-  "DetailArmorBar*"
-  "HealthOverlay*"
-  "fancymenu*"
-  "bhmenu*"
-  "BHMenu*"
-  "catalogue*"
-  "defaultoptions*"
-  "lootbeams*"
-  "toastcontrol*"
-  "ToastControl*"
-  "Titles*"                  # title display mod, client-only
-  "TravelersTitles*"
-  "travelerstitles*"
-  "BetterAdvancements*"
-  "betteradvancements*"
-  "StylishEffects*"
-  "stylisheffects*"
-  "light-overlay*"
-  "lightoverlay*"
-
-  # --- MINIMAP / WORLD MAP ---
-  # NOTE: Xaeros mods CAN be kept if you want server-side waypoint sync
-  # Comment these out if you use Xaeros server sync features
-  "Xaeros_Minimap*"
-  "XaerosWorldMap*"
-  "xaerominimap*"
-  "xaeroworldmap*"
-
-  # --- SOUND / ATMOSPHERE ---
-  "ambientsounds*"
-  "extremesoundmuffler*"
-  "ExtremeSoundMuffler*"
-  "Pretty*Rain*"
-  "particlerain*"
-  "immersive_melodies*"
-
-  # --- COSMETICS ---
-  "CosmeticArmorReworked*"
-  "cosmeticarmorreworked*"
-  "CosmeticArmours*"
-  "cosmeticarmoursmod*"
-  "simplehats*"
-  "usefulhats*"
-
-  # --- CLIENT-ONLY DEPENDENCY MODS ---
-  # These are required by client mods above but crash if kept without their dependents
-  "iceberg*"                 # required by highlighter + merchantmarkers (both client-only)
-  "Highlighter*"             # client-only HUD mod, requires iceberg
-  "highlighter*"
-  "MerchantMarkers*"         # client-only HUD mod, requires iceberg
-  "merchantmarkers*"
-  "prism*"                   # client-only colour library
-
-  # --- VISUAL KEYBINDING / CONTROLS ---
-  "visual_keybinder*"
-  "controlling*"
-  "Controlling*"
-
-  # --- PERFORMANCE (client-only variants) ---
-  "immediatelyfast*"
-
+  "oculus*"           "embeddium*"        "rubidium*"
+  "iris*"             "optifine*"         "optifabric*"
+  "EuphoriaPatcher*"  "euphoria_patcher*" "gpumemleakfix*"
+  "fancymenu*"        "legendarytooltips*" "itemphysiclite*"
+  "lootbeams*"        "toastcontrol*"      "ToastControl*"
+  "light-overlay*"    "lightoverlay*"      "BetterAdvancements*"
+  "Xaeros_Minimap*"   "XaerosWorldMap*"
+  "CosmeticArmorReworked*" "cosmeticarmorreworked*"
+  "skinlayers*"       "3dskinlayers*"      "entityculling*"
+  "not-enough-animations*" "visuality*"
 )
 
-# =============================================================================
-# MAIN LOGIC — do not edit below this line
-# =============================================================================
+matches_pattern() {
+  local name_lower="${1,,}"
+  for pattern in "${CLIENT_ONLY_PATTERNS[@]}"; do
+    case "$name_lower" in
+      ${pattern,,}) return 0 ;;
+    esac
+  done
+  return 1
+}
 
-if [[ ! -d "$MODS_DIR" ]]; then
-  log "ERROR: mods directory not found at $MODS_DIR"
-  exit 1
-fi
-
+# =============================================================================
+# RESTORE MODE
+# =============================================================================
 if "$RESTORE"; then
   if [[ ! -d "$DISABLED_DIR" ]]; then
-    log "No disabled mods directory found at $DISABLED_DIR — nothing to restore."
+    log "No disabled mods directory at $DISABLED_DIR — nothing to restore."
     exit 0
   fi
-  log "Restoring mods from $DISABLED_DIR back to $MODS_DIR..."
+  log "Restoring mods from $DISABLED_DIR -> $MODS_DIR..."
   count=0
   for jar in "$DISABLED_DIR"/*.jar; do
     [[ -f "$jar" ]] || continue
@@ -168,58 +254,89 @@ if "$RESTORE"; then
     fi
     ((count++)) || true
   done
-  "$DRY_RUN" && log "Dry run complete. $count mod(s) would be restored. Use --apply --restore to actually restore." \
-             || log "Restored $count mod(s)."
+  "$DRY_RUN" \
+    && log "Dry run: $count mod(s) would be restored. Run with --apply --restore to actually restore." \
+    || log "Restored $count mod(s)."
   exit 0
 fi
 
-mkdir -p "$DISABLED_DIR"
+# =============================================================================
+# SCAN MODE
+# =============================================================================
+if [[ ! -d "$MODS_DIR" ]]; then
+  log "ERROR: mods directory not found at $MODS_DIR"
+  exit 1
+fi
 
-log "Scanning $MODS_DIR for client-only mods..."
+mkdir -p "$DISABLED_DIR"
+: > "$LOG_FILE" 2>/dev/null || true
+
+log "Scanning $MODS_DIR for client-only mods (metadata-first)..."
 "$DRY_RUN" && log "(DRY RUN — use --apply to actually move files)"
 echo ""
+
+metadata_removed=0
+pattern_removed=0
+skipped_unknown=0
+server_safe=0
 
 for jar in "$MODS_DIR"/*.jar; do
   [[ -f "$jar" ]] || continue
   name="$(basename "$jar")"
-  name_lower="${name,,}"
 
-  matched=false
-  matched_pattern=""
-  for pattern in "${CLIENT_ONLY_PATTERNS[@]}"; do
-    # Skip commented-out lines (shouldn't happen with array but safety check)
-    [[ "$pattern" == \#* ]] && continue
-    [[ -z "$pattern" ]] && continue
-    pattern_lower="${pattern,,}"
-    # shellcheck disable=SC2254
-    case "$name_lower" in
-      $pattern_lower)
-        matched=true
-        matched_pattern="$pattern"
-        break
-        ;;
-    esac
-  done
+  # Step 1: Try metadata detection
+  env_result="$(detect_mod_environment "$jar" 2>/dev/null)" || env_result="unknown"
 
-  if "$matched"; then
+  if [[ "$env_result" == "client" ]]; then
+    reason="metadata"
     if "$DRY_RUN"; then
-      log "  [would disable] $name  (matched: $matched_pattern)"
+      echo "[cleaner]   [would disable] $name  ($reason)"
     else
       mv "$jar" "$DISABLED_DIR/$name"
-      log "  [disabled] $name  (matched: $matched_pattern)"
+      echo "[cleaner]   [disabled] $name  ($reason)" | tee -a "$LOG_FILE"
     fi
     ((moved++)) || true
+    ((metadata_removed++)) || true
+    continue
   fi
+
+  if [[ "$env_result" == "server" || "$env_result" == "both" ]]; then
+    # Explicitly declared server-compatible — trust it, skip pattern check
+    ((server_safe++)) || true
+    continue
+  fi
+
+  # Step 2: metadata unknown — fall back to filename patterns
+  if matches_pattern "$name"; then
+    reason="filename pattern (no metadata)"
+    if "$DRY_RUN"; then
+      echo "[cleaner]   [would disable] $name  ($reason)"
+    else
+      mv "$jar" "$DISABLED_DIR/$name"
+      echo "[cleaner]   [disabled] $name  ($reason)" | tee -a "$LOG_FILE"
+    fi
+    ((moved++)) || true
+    ((pattern_removed++)) || true
+    continue
+  fi
+
+  ((skipped_unknown++)) || true
 done
 
 echo ""
 if "$DRY_RUN"; then
   log "Dry run complete."
-  log "  $moved mod(s) would be moved to $DISABLED_DIR"
+  log "  Would disable: $moved mod(s)  ($metadata_removed via metadata, $pattern_removed via filename)"
+  log "  Server-safe (explicit metadata): $server_safe mod(s)"
+  log "  Unknown environment (kept): $skipped_unknown mod(s)"
   log ""
-  log "  Run with --apply to actually move them."
-  log "  Run with --restore to move them back."
+  log "  Run with --apply to move them."
+  log "  Run with --restore --apply to move them back."
 else
-  log "Done. $moved mod(s) moved to $DISABLED_DIR"
-  log "To restore them: bash clientmod_cleaner.sh --restore --apply"
+  log "Done."
+  log "  Disabled: $moved mod(s)  ($metadata_removed via metadata, $pattern_removed via filename)"
+  log "  Server-safe (explicit metadata): $server_safe mod(s)"
+  log "  Unknown environment (kept): $skipped_unknown mod(s)"
+  log "  Log: $LOG_FILE"
+  log "  To restore: bash clientmod_cleaner.sh --restore --apply"
 fi
