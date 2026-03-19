@@ -101,4 +101,31 @@ fi
 
 rm -f ./serversetup ./run.bat ./run.sh 2>/dev/null || true
 
+# Write initial pack info for the website Version tab
+# switch_modpack.sh will enrich this on boot once MC version / loader is detected
+if [[ -f "./version.json" ]]; then
+  python3 -c "
+import json, datetime
+try:
+    d=json.load(open('version.json','r',encoding='utf-8'))
+    name=d.get('name','') or d.get('pack',{}).get('name','')
+    ver=d.get('version','') or d.get('pack',{}).get('version','')
+except Exception:
+    name=''
+    ver=''
+info = {
+  'provider':     'ftb',
+  'pack_id':      '${PACK_ID}',
+  'file_id':      '${VERSION_ID}',
+  'pack_name':    name,
+  'pack_version': ver,
+  'mc_version':   '',
+  'loader':       '',
+  'updated_at':   datetime.datetime.utcnow().isoformat() + 'Z',
+}
+json.dump(info, open('.bb_pack_info.json','w'), indent=2)
+print('[ftb] Pack info written to .bb_pack_info.json')
+" 2>/dev/null || true
+fi
+
 echo "[ftb] Install completed."
