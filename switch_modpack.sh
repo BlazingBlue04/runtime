@@ -499,25 +499,36 @@ run_installer() {
         exit 1
       fi
       if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(echo "$paper_versions_json" | grep -o '"versions":\[[^]]*\]' | grep -o '"[0-9][^"]*"' | tail -1 | tr -d '"' || true)"
+        mc_ver="$(echo "$paper_versions_json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+versions=[v for v in d.get('versions',[]) if not any(x in v for x in ['pre','rc','snapshot'])]
+print(versions[-1] if versions else '')
+" 2>/dev/null | tr -d '[:space:]')"
         if [[ -z "$mc_ver" ]]; then
-          err "Could not parse latest Paper mc version."
+          err "Could not parse latest Paper MC version."
           exit 1
         fi
-        log "Resolved latest Paper mc version: $mc_ver"
+        log "Resolved latest Paper MC version: $mc_ver"
       fi
       local builds_json build
       builds_json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 15 \
-        "https://api.papermc.io/v2/projects/paper/versions/${mc_ver}" 2>/dev/null || true)"
-      build="$(echo "$builds_json" | grep -o '"builds":\[[^]]*\]' | grep -o '[0-9]*' | tail -1 || true)"
+        "https://api.papermc.io/v2/projects/paper/versions/${mc_ver}/builds" 2>/dev/null || true)"
+      build="$(echo "$builds_json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+builds=[b['build'] for b in d.get('builds',[]) if b.get('channel','') == 'default']
+print(builds[-1] if builds else '')
+" 2>/dev/null | tr -d '[:space:]')"
       if [[ -z "$build" ]]; then
-        err "Could not determine latest Paper build for mc $mc_ver."
+        err "Could not determine latest Paper build for MC $mc_ver."
         exit 1
       fi
       local paper_jar="paper-${mc_ver}-${build}.jar"
       local paper_url="https://api.papermc.io/v2/projects/paper/versions/${mc_ver}/builds/${build}/downloads/${paper_jar}"
       log "Downloading Paper $mc_ver build $build: $paper_url"
       curl -fsSL --retry 3 --retry-delay 2 --max-time 120 -o server.jar "$paper_url"
+      accept_eula
       log "Paper $mc_ver build $build installed."
       ;;
     modrinth)
@@ -601,7 +612,45 @@ run_installer() {
         -downloadMinecraft \
         || { err "Fabric installer failed."; exit 1; }
       rm -f fabric-installer.jar
+      accept_eula
       log "Fabric $mc_ver installed."
+      ;;
+    quilt)
+      local mc_ver="${MC_VERSION:-latest}"
+      local loader_ver="${FABRIC_LOADER_VERSION:-latest}"  # reuse FABRIC_LOADER_VERSION for quilt
+      log "Installing Quilt server (mc=$mc_ver)..."
+
+      if [[ "$mc_ver" == "latest" ]]; then
+        mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
+          | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latest']['release'])" 2>/dev/null || true)"
+        [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
+      fi
+
+      # Get latest Quilt installer
+      local quilt_inst_ver
+      quilt_inst_ver="$(curl -fsSL --retry 3 --max-time 15 \
+        https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-installer/maven-metadata.xml 2>/dev/null \
+        | grep -oP '(?<=<release>)[^<]+' | head -1 || true)"
+      quilt_inst_ver="${quilt_inst_ver:-0.9.3}"
+      log "Quilt installer version: $quilt_inst_ver"
+
+      local inst_url="https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-installer/${quilt_inst_ver}/quilt-installer-${quilt_inst_ver}.jar"
+      log "Downloading Quilt installer: $inst_url"
+      curl -fsSL --retry 3 --max-time 60 -o quilt-installer.jar "$inst_url" \
+        || { err "Failed to download Quilt installer."; exit 1; }
+
+      local java_bin
+      java_bin="$(java_for "$mc_ver" "fabric")"
+      export PATH="$(dirname "$java_bin"):$PATH"
+      export JAVA_HOME="$(dirname "$(dirname "$java_bin")")"
+
+      "$java_bin" -Djava.awt.headless=true -jar quilt-installer.jar install server "$mc_ver" \
+        ${loader_ver:+"--loader-version=$loader_ver"} \
+        --download-server --install-dir=. \
+        || { err "Quilt installer failed."; exit 1; }
+      rm -f quilt-installer.jar
+      accept_eula
+      log "Quilt $mc_ver installed."
       ;;
     forge)
       local mc_ver="${MC_VERSION:-latest}"
@@ -772,7 +821,10 @@ print(deps.get('minecraft',''))
 detect_loader() {
   if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then echo "neoforge"; return; fi
   if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then echo "forge"; return; fi
+  if has_glob "./libraries/org/quiltmc/quilt-loader/*/quilt-loader-*.jar"; then echo "quilt"; return; fi
   if has_glob "./libraries/net/fabricmc/fabric-loader/*/fabric-loader-*.jar"; then echo "fabric"; return; fi
+  # Detect from quilt-server-launch jar
+  if has_glob "./quilt-server-launch.jar"; then echo "quilt"; return; fi
   # Detect from forge jar presence (older packs without libraries/)
   if has_glob "./forge-*-universal.jar" || has_glob "./forge-*.jar"; then echo "forge"; return; fi
   # Detect from manifest.json
@@ -780,14 +832,15 @@ detect_loader() {
     local lid=""
     lid="$(jq -r '(.minecraft.modLoaders[0].id // empty)' manifest.json 2>/dev/null || true)"
     case "$lid" in
-      forge-*) echo "forge"; return ;;
+      forge-*)    echo "forge"; return ;;
       neoforge-*) echo "neoforge"; return ;;
-      fabric-*) echo "fabric"; return ;;
-      quilt-*) echo "quilt"; return ;;
+      fabric-*)   echo "fabric"; return ;;
+      quilt-*)    echo "quilt"; return ;;
     esac
   fi
-  # Detect from ServerStart.sh / start script content referencing forge
+  # Detect from start script content
   for sf in ./ServerStart.sh ./startserver.sh ./run.sh; do
+    if [[ -f "$sf" ]] && grep -qi 'quilt' "$sf" 2>/dev/null; then echo "quilt"; return; fi
     if [[ -f "$sf" ]] && grep -qi 'forge' "$sf" 2>/dev/null; then echo "forge"; return; fi
   done
   echo "<unknown>"
@@ -815,8 +868,6 @@ java_for() {
     local minor="${BASH_REMATCH[1]}"
 
     # 1.0 – 1.16: Java 8
-    # Note: 1.13-1.16 technically works on Java 11 but many Forge packs for
-    # these versions break on anything newer than Java 8 due to LaunchWrapper
     if (( minor <= 16 )); then echo "/opt/java/8/bin/java"; return; fi
 
     # 1.17 – 1.20: Java 17
@@ -826,7 +877,7 @@ java_for() {
     echo "/opt/java/21/bin/java"; return
   fi
 
-  # Non-standard version string (e.g. snapshot) — default to 21
+  # Non-standard version string — default to 21
   echo "/opt/java/21/bin/java"
 }
 
@@ -1656,14 +1707,46 @@ LOADER="$(detect_loader)"
 write_pack_info() {
   local pack_name="" pack_version=""
 
+  # CurseForge — manifest.json
   if [[ -f "./manifest.json" ]]; then
     pack_name="$(python3 -c "import json; d=json.load(open('manifest.json','r',encoding='utf-8')); print(d.get('name',''))" 2>/dev/null | tr -d '\r\n')" || pack_name=""
     pack_version="$(python3 -c "import json; d=json.load(open('manifest.json','r',encoding='utf-8')); print(d.get('version',''))" 2>/dev/null | tr -d '\r\n')" || pack_version=""
   fi
 
+  # Modrinth — modrinth.index.json
   if [[ -z "$pack_name" && -f "./modrinth.index.json" ]]; then
     pack_name="$(python3 -c "import json; d=json.load(open('modrinth.index.json','r',encoding='utf-8')); print(d.get('name',''))" 2>/dev/null | tr -d '\r\n')" || pack_name=""
     pack_version="$(python3 -c "import json; d=json.load(open('modrinth.index.json','r',encoding='utf-8')); print(d.get('versionId',''))" 2>/dev/null | tr -d '\r\n')" || pack_version=""
+  fi
+
+  # FTB — version.json (written by the FTB serversetup installer)
+  if [[ -z "$pack_name" && -f "./version.json" ]]; then
+    pack_name="$(python3 -c "
+import json
+d=json.load(open('version.json','r',encoding='utf-8'))
+# FTB version.json has 'name' at top level or nested under 'pack'
+name=d.get('name','') or d.get('pack',{}).get('name','')
+print(name)
+" 2>/dev/null | tr -d '\r\n')" || pack_name=""
+    pack_version="$(python3 -c "
+import json
+d=json.load(open('version.json','r',encoding='utf-8'))
+ver=d.get('version','') or d.get('pack',{}).get('version','')
+print(ver)
+" 2>/dev/null | tr -d '\r\n')" || pack_version=""
+  fi
+
+  # Standalone server types — use a friendly label if no pack name found
+  if [[ -z "$pack_name" ]]; then
+    case "${PROVIDER:-}" in
+      vanilla)  pack_name="Vanilla Minecraft" ;;
+      paper)    pack_name="Paper" ;;
+      fabric)   pack_name="Fabric" ;;
+      forge)    pack_name="Forge" ;;
+      neoforge) pack_name="NeoForge" ;;
+      quilt)    pack_name="Quilt" ;;
+      bedrock)  pack_name="Bedrock" ;;
+    esac
   fi
 
   local _prov="${PROVIDER:-unknown}"
@@ -1739,5 +1822,32 @@ if [[ "${CLEAN_CLIENT_MODS:-false}" == "true" || "${CLEAN_CLIENT_MODS:-false}" =
 else
   log "CLEAN_CLIENT_MODS not set — skipping client mod cleaner. Set to 'true' in startup vars to enable."
 fi
+
+# ---------------------------------------
+# Crash log trap — on unexpected exit, save last lines of log to .bb_last_crash.log
+# ---------------------------------------
+BB_CRASH_LOG=".bb_last_crash.log"
+_bb_on_exit() {
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    {
+      echo "=== BlazingBlue crash log ==="
+      echo "Exit code: $rc"
+      echo "Time: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      echo "Provider: ${PROVIDER:-unknown}"
+      echo "MC Version: ${MC_VER:-unknown}"
+      echo "Loader: ${LOADER:-unknown}"
+      echo ""
+      echo "=== Last 60 lines of latest.log ==="
+      if [[ -f "./logs/latest.log" ]]; then
+        tail -n 60 "./logs/latest.log"
+      else
+        echo "(logs/latest.log not found)"
+      fi
+    } > "$BB_CRASH_LOG" 2>/dev/null || true
+    log "Server exited with code $rc. Crash info saved to $BB_CRASH_LOG"
+  fi
+}
+trap '_bb_on_exit' EXIT
 
 start_server "$MC_VER" "$LOADER"
