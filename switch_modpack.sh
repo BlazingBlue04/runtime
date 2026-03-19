@@ -303,9 +303,25 @@ if [[ -z "${CF_PROJECT_ID}" && "$current_key" =~ ^curseforge:([0-9]+): ]]; then
 fi
 
 # Desired key (include MC_VERSION for vanilla/paper so version changes trigger reinstall)
+# For CurseForge, resolve "latest" to the actual file ID so restarts don't re-download
+# when the pack hasn't changed. The resolved ID gets stored in .bb_resolved_file_id.
+RESOLVED_VERSION_ID="${VERSION_ID_NORM:-latest}"
+if [[ "${PROVIDER:-}" == "curseforge" && "${VERSION_ID_NORM:-latest}" == "latest" && -n "${PACK_ID_NORM:-}" ]]; then
+  if [[ -f ".bb_resolved_file_id" ]]; then
+    _stored_resolved="$(cat ".bb_resolved_file_id" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "$_stored_resolved" ]]; then
+      RESOLVED_VERSION_ID="$_stored_resolved"
+      debug "Using stored resolved file ID: $RESOLVED_VERSION_ID"
+    fi
+  fi
+fi
+
 case "${PROVIDER:-unknown}" in
   vanilla|paper|fabric|forge|neoforge)
     desired_key="${PROVIDER:-unknown}::${MC_VERSION:-latest}::${VERSION_ID_NORM:-latest}"
+    ;;
+  curseforge)
+    desired_key="curseforge::${PACK_ID_NORM:-}::${RESOLVED_VERSION_ID}"
     ;;
   *)
     desired_key="${PROVIDER:-unknown}::${PACK_ID_NORM:-}::${VERSION_ID_NORM:-latest}"
@@ -484,34 +500,60 @@ strip_mc() {
 
 detect_mc_version() {
   local v=""
-  # serverpack libraries path
+
+  # 1. Read from .bb_pack_info.json (written after install — most reliable)
+  if [[ -f ".bb_pack_info.json" ]]; then
+    v="$(python3 -c "import json; d=json.load(open('.bb_pack_info.json')); print(d.get('mc_version',''))" 2>/dev/null || true)"
+    v="$(echo "$v" | tr -d '[:space:]')"
+    if [[ -n "$v" && "$v" != "null" ]]; then echo "$v"; return; fi
+  fi
+
+  # 2. manifest.json (CurseForge/Modrinth client packs)
+  if [[ -f "./manifest.json" ]]; then
+    v="$(python3 -c "
+import json
+d=json.load(open('manifest.json','r',encoding='utf-8'))
+mc=d.get('minecraft',{}).get('version','')
+print(mc)
+" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$v" && "$v" != "null" ]]; then echo "$v"; return; fi
+  fi
+
+  # 3. modrinth.index.json
+  if [[ -f "./modrinth.index.json" ]]; then
+    v="$(python3 -c "
+import json
+d=json.load(open('modrinth.index.json','r',encoding='utf-8'))
+deps=d.get('dependencies',{})
+print(deps.get('minecraft',''))
+" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$v" && "$v" != "null" ]]; then echo "$v"; return; fi
+  fi
+
+  # 4. Pterodactyl libraries path (most reliable for installed Forge/NeoForge/Fabric)
   if has_glob "./libraries/net/minecraft/server/*"; then
-    v="$(ls -1d ./libraries/net/minecraft/server/* 2>/dev/null | head -n1 | sed 's#.*/##')"
+    v="$(ls -1d ./libraries/net/minecraft/server/* 2>/dev/null | tail -n1 | sed 's#.*/##')"
+    v="$(strip_mc "$v")"
   fi
-  # sometimes a server jar is named minecraft_server.1.16.5.jar
-  if [[ -z "$v" ]] && has_glob "./minecraft_server.*.jar"; then
-    v="$(ls -1 ./minecraft_server.*.jar 2>/dev/null | head -n1 | sed -E 's#^(\./)?minecraft_server\.([0-9]+\.[0-9]+(\.[0-9]+)?).*#\2#')"
-  fi
-  # parse from forge jar name
+
+  # 5. Forge jar name: forge-1.12.2-14.23.5.2860.jar
   if [[ -z "$v" ]] && has_glob "./forge-*.jar"; then
-    v="$(ls -1 ./forge-*.jar 2>/dev/null | head -n1 | sed -E 's#^(\./)?forge-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\2#')"
-  fi
-  v="$(strip_mc "$v")"
-
-  # Fallback: parse from manifest.json if present
-  if [[ -z "$v" && -f "./manifest.json" ]]; then
-    v="$(jq -r '.minecraft.version // empty' manifest.json 2>/dev/null || true)"
-    if [[ -z "$v" ]]; then
-      v="$(jq -r '.minecraft.version // empty' manifest.json 2>/dev/null || true)"
-    fi
+    v="$(ls -1 ./forge-*.jar 2>/dev/null | head -n1 | sed -E 's#^(./)?forge-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\2#')"
   fi
 
-  # Fallback: detect from mod filenames (e.g. *-1.12.2-*.jar in mods/)
+  # 6. minecraft_server.1.21.4.jar
+  if [[ -z "$v" ]] && has_glob "./minecraft_server.*.jar"; then
+    v="$(ls -1 ./minecraft_server.*.jar 2>/dev/null | head -n1 | sed -E 's#^(./)?minecraft_server\.([0-9]+\.[0-9]+(\.[0-9]+)?).*#\2#')"
+  fi
+
+  # 7. Infer from mod filenames in mods/
   if [[ -z "$v" && -d "./mods" ]]; then
     v="$(find ./mods -maxdepth 1 -type f -name '*.jar' 2>/dev/null \
+      | xargs -I{} basename {} 2>/dev/null \
       | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | sort | uniq -c | sort -rn | head -n1 | awk '{print $2}' || true)"
   fi
 
+  v="$(strip_mc "${v:-}")"
   echo "${v:-<unknown>}"
 }
 
@@ -546,25 +588,33 @@ java_for() {
   local mc="$1"
   local loader="$2"
 
+  # NeoForge always requires Java 21
   if [[ "$loader" == "neoforge" ]]; then
     echo "/opt/java/21/bin/java"; return
   fi
 
-  # If unknown, default to 21 (most modern); start scripts often override args anyway.
+  # Unknown MC version — default to 21 (modern default)
   if [[ "$mc" == "<unknown>" ]]; then
     echo "/opt/java/21/bin/java"; return
   fi
 
-  # Very old packs (1.12.2 and earlier) MUST use Java 8 (LaunchWrapper breaks on Java 9+)
+  # Parse minor version
   if [[ "$mc" =~ ^1\.([0-9]+) ]]; then
     local minor="${BASH_REMATCH[1]}"
-    if (( minor <= 12 )); then echo "/opt/java/8/bin/java"; return; fi
+
+    # 1.0 – 1.16: Java 8
+    # Note: 1.13-1.16 technically works on Java 11 but many Forge packs for
+    # these versions break on anything newer than Java 8 due to LaunchWrapper
     if (( minor <= 16 )); then echo "/opt/java/8/bin/java"; return; fi
+
+    # 1.17 – 1.20: Java 17
     if (( minor <= 20 )); then echo "/opt/java/17/bin/java"; return; fi
-    # 1.21+
+
+    # 1.21+: Java 21
     echo "/opt/java/21/bin/java"; return
   fi
 
+  # Non-standard version string (e.g. snapshot) — default to 21
   echo "/opt/java/21/bin/java"
 }
 
@@ -1372,6 +1422,15 @@ start_server() {
 if [[ "$need_reinstall" -eq 1 ]]; then
   deep_wipe
   run_installer
+  # After CurseForge install, store the resolved file ID so future restarts
+  # don't re-download when VERSION_ID=latest and the pack hasn't changed
+  if [[ "${PROVIDER:-}" == "curseforge" && -n "${CF_FILE_ID:-}" && "${CF_FILE_ID}" != "latest" ]]; then
+    echo "${CF_FILE_ID}" > ".bb_resolved_file_id"
+    RESOLVED_VERSION_ID="${CF_FILE_ID}"
+    # Rewrite desired_key with the resolved ID
+    desired_key="curseforge::${PACK_ID_NORM:-}::${CF_FILE_ID}"
+    log "Stored resolved CurseForge file ID: ${CF_FILE_ID}"
+  fi
   echo "$desired_key" > "$LOCK_FILE"
   log "Install complete. Lock updated."
 fi
@@ -1380,6 +1439,63 @@ MC_VER="$(detect_mc_version)"
 LOADER="$(detect_loader)"
 
 # ---------------------------------------
+# Write .bb_pack_info.json — read by the website Version tab to show pack name/version
+# ---------------------------------------
+write_pack_info() {
+  local pack_name="" pack_version=""
+
+  if [[ -f "./manifest.json" ]]; then
+    pack_name="$(python3 -c "import json; d=json.load(open('manifest.json','r',encoding='utf-8')); print(d.get('name',''))" 2>/dev/null | tr -d '\r\n')" || pack_name=""
+    pack_version="$(python3 -c "import json; d=json.load(open('manifest.json','r',encoding='utf-8')); print(d.get('version',''))" 2>/dev/null | tr -d '\r\n')" || pack_version=""
+  fi
+
+  if [[ -z "$pack_name" && -f "./modrinth.index.json" ]]; then
+    pack_name="$(python3 -c "import json; d=json.load(open('modrinth.index.json','r',encoding='utf-8')); print(d.get('name',''))" 2>/dev/null | tr -d '\r\n')" || pack_name=""
+    pack_version="$(python3 -c "import json; d=json.load(open('modrinth.index.json','r',encoding='utf-8')); print(d.get('versionId',''))" 2>/dev/null | tr -d '\r\n')" || pack_version=""
+  fi
+
+  local _prov="${PROVIDER:-unknown}"
+  local _pid="${PACK_ID_NORM:-}"
+  local _fid="${RESOLVED_VERSION_ID:-${VERSION_ID_NORM:-}}"
+  local _mc="${MC_VER:-<unknown>}"
+  local _loader="${LOADER:-<unknown>}"
+
+  python3 -c "
+import json, datetime
+info = {
+  'provider':     '$_prov',
+  'pack_id':      '$_pid',
+  'file_id':      '$_fid',
+  'pack_name':    '$pack_name',
+  'pack_version': '$pack_version',
+  'mc_version':   '$_mc',
+  'loader':       '$_loader',
+  'updated_at':   datetime.datetime.utcnow().isoformat() + 'Z',
+}
+json.dump(info, open('.bb_pack_info.json','w'), indent=2)
+" 2>/dev/null && log "Pack info written to .bb_pack_info.json" || log "WARN: Could not write .bb_pack_info.json"
+}
+write_pack_info
+
+# ---------------------------------------
+# WIPE_WORLD — delete world folder(s) then warn user to reset it
+# ---------------------------------------
+if [[ "${WIPE_WORLD:-0}" == "1" || "${WIPE_WORLD:-0}" == "true" ]]; then
+  log "WIPE_WORLD=1 — deleting world folder(s)..."
+  LEVEL_NAME="world"
+  if [[ -f "./server.properties" ]]; then
+    _ln="$(grep -E '^level-name\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')"
+    [[ -n "${_ln:-}" ]] && LEVEL_NAME="$_ln"
+  fi
+  for _wdir in "$LEVEL_NAME" "${LEVEL_NAME}_nether" "${LEVEL_NAME}_the_end" "world" "world_nether" "world_the_end"; do
+    if [[ -d "./$_wdir" ]]; then
+      rm -rf "./$_wdir"
+      log "  Deleted: $_wdir"
+    fi
+  done
+  log "World wipe complete. A new world will generate on next startup."
+  log "⚠ Set WIPE_WORLD back to 0 in startup variables to avoid wiping again on the next restart."
+fi
 # JVM args generator — regenerates user_jvm_args.txt based on SERVER_MEMORY
 # Ensures correct heap size even if RAM allocation changes between boots.
 # ---------------------------------------
