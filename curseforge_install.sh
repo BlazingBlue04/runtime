@@ -518,19 +518,13 @@ download_mods_from_manifest_if_needed
 echo "[curseforge] Install complete."
 
 # Write initial pack info for the website Version tab
-# switch_modpack.sh will overwrite this with more complete info on boot
-python3 -c "
-import json, datetime
-info = {
-  'provider':     'curseforge',
-  'pack_id':      '${PACK_ID}',
-  'file_id':      '${VERSION_ID}',
-  'pack_name':    '${MOD_NAME}',
-  'pack_version': '',
-  'mc_version':   '',
-  'loader':       '',
-  'updated_at':   datetime.datetime.utcnow().isoformat() + 'Z',
-}
-json.dump(info, open('.bb_pack_info.json','w'), indent=2)
-print('[curseforge] Pack info written to .bb_pack_info.json')
-" 2>/dev/null || true
+_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown')"
+jq -n \
+  --arg provider  "curseforge" \
+  --arg pack_id   "${PACK_ID}" \
+  --arg file_id   "${VERSION_ID}" \
+  --arg pack_name "${MOD_NAME}" \
+  --arg updated   "$_ts" \
+  '{provider:$provider,pack_id:$pack_id,file_id:$file_id,pack_name:$pack_name,pack_version:"",mc_version:"",loader:"",updated_at:$updated}' \
+  > .bb_pack_info.json 2>/dev/null \
+  && echo "[curseforge] Pack info written to .bb_pack_info.json" || true
