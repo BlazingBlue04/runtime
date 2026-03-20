@@ -499,12 +499,7 @@ run_installer() {
         exit 1
       fi
       if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(echo "$paper_versions_json" | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-versions=[v for v in d.get('versions',[]) if not any(x in v for x in ['pre','rc','snapshot'])]
-print(versions[-1] if versions else '')
-" 2>/dev/null | tr -d '[:space:]')"
+        mc_ver="$(echo "$paper_versions_json" | jq -r '[.versions[] | select(test("pre|rc|snapshot") | not)] | last // empty' 2>/dev/null | tr -d '[:space:]')"
         if [[ -z "$mc_ver" ]]; then
           err "Could not parse latest Paper MC version."
           exit 1
@@ -514,12 +509,7 @@ print(versions[-1] if versions else '')
       local builds_json build
       builds_json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 15 \
         "https://api.papermc.io/v2/projects/paper/versions/${mc_ver}/builds" 2>/dev/null || true)"
-      build="$(echo "$builds_json" | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-builds=[b['build'] for b in d.get('builds',[]) if b.get('channel','') == 'default']
-print(builds[-1] if builds else '')
-" 2>/dev/null | tr -d '[:space:]')"
+      build="$(echo "$builds_json" | jq -r '[.builds[] | select(.channel == "default")] | last | .build // empty' 2>/dev/null | tr -d '[:space:]')"
       if [[ -z "$build" ]]; then
         err "Could not determine latest Paper build for MC $mc_ver."
         exit 1
@@ -582,7 +572,7 @@ print(builds[-1] if builds else '')
       # Resolve latest MC version
       if [[ "$mc_ver" == "latest" ]]; then
         mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
-          | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latest']['release'])" 2>/dev/null || true)"
+          | jq -r '.latest.release // empty' 2>/dev/null || true)"
         [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
         log "Resolved latest MC version: $mc_ver"
       fi
@@ -622,7 +612,7 @@ print(builds[-1] if builds else '')
 
       if [[ "$mc_ver" == "latest" ]]; then
         mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
-          | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latest']['release'])" 2>/dev/null || true)"
+          | jq -r '.latest.release // empty' 2>/dev/null || true)"
         [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
       fi
 
@@ -659,22 +649,19 @@ print(builds[-1] if builds else '')
 
       if [[ "$mc_ver" == "latest" ]]; then
         mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
-          | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latest']['release'])" 2>/dev/null || true)"
+          | jq -r '.latest.release // empty' 2>/dev/null || true)"
         [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
       fi
 
       if [[ "$forge_ver" == "latest" || -z "$forge_ver" ]]; then
-        # Fetch latest recommended Forge version from Maven metadata
-        forge_ver="$(curl -fsSL --retry 3 --max-time 15 \
-          "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json" 2>/dev/null \
-          | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-promos=d.get('promos',{})
-key='${mc_ver}-recommended'
-if key in promos: print(promos[key])
-elif '${mc_ver}-latest' in promos: print(promos['${mc_ver}-latest'])
-" 2>/dev/null || true)"
+        local _promos
+        _promos="$(curl -fsSL --retry 3 --max-time 15 \
+          "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json" 2>/dev/null || true)"
+        # Try recommended first, then latest
+        forge_ver="$(echo "$_promos" | jq -r --arg k "${mc_ver}-recommended" '.promos[$k] // empty' 2>/dev/null || true)"
+        if [[ -z "$forge_ver" ]]; then
+          forge_ver="$(echo "$_promos" | jq -r --arg k "${mc_ver}-latest" '.promos[$k] // empty' 2>/dev/null || true)"
+        fi
         if [[ -z "$forge_ver" ]]; then
           err "Could not resolve Forge version for MC $mc_ver. Set FORGE_VERSION explicitly (e.g. 1.20.1-47.2.0)."
           exit 1
@@ -706,7 +693,7 @@ elif '${mc_ver}-latest' in promos: print(promos['${mc_ver}-latest'])
 
       if [[ "$mc_ver" == "latest" ]]; then
         mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
-          | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latest']['release'])" 2>/dev/null || true)"
+          | jq -r '.latest.release // empty' 2>/dev/null || true)"
         [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
       fi
 
@@ -764,30 +751,19 @@ detect_mc_version() {
 
   # 1. Read from .bb_pack_info.json (written after install — most reliable)
   if [[ -f ".bb_pack_info.json" ]]; then
-    v="$(python3 -c "import json; d=json.load(open('.bb_pack_info.json')); print(d.get('mc_version',''))" 2>/dev/null || true)"
-    v="$(echo "$v" | tr -d '[:space:]')"
-    if [[ -n "$v" && "$v" != "null" ]]; then echo "$v"; return; fi
+    v="$(jq -r '.mc_version // empty' .bb_pack_info.json 2>/dev/null | tr -d '[:space:]')" || v=""
+    if [[ -n "$v" && "$v" != "null" && "$v" != "<unknown>" ]]; then echo "$v"; return; fi
   fi
 
   # 2. manifest.json (CurseForge/Modrinth client packs)
   if [[ -f "./manifest.json" ]]; then
-    v="$(python3 -c "
-import json
-d=json.load(open('manifest.json','r',encoding='utf-8'))
-mc=d.get('minecraft',{}).get('version','')
-print(mc)
-" 2>/dev/null | tr -d '[:space:]')"
+    v="$(jq -r '.minecraft.version // empty' manifest.json 2>/dev/null | tr -d '[:space:]')" || v=""
     if [[ -n "$v" && "$v" != "null" ]]; then echo "$v"; return; fi
   fi
 
   # 3. modrinth.index.json
   if [[ -f "./modrinth.index.json" ]]; then
-    v="$(python3 -c "
-import json
-d=json.load(open('modrinth.index.json','r',encoding='utf-8'))
-deps=d.get('dependencies',{})
-print(deps.get('minecraft',''))
-" 2>/dev/null | tr -d '[:space:]')"
+    v="$(jq -r '.dependencies.minecraft // empty' modrinth.index.json 2>/dev/null | tr -d '[:space:]')" || v=""
     if [[ -n "$v" && "$v" != "null" ]]; then echo "$v"; return; fi
   fi
 
@@ -1709,31 +1685,20 @@ write_pack_info() {
 
   # CurseForge — manifest.json
   if [[ -f "./manifest.json" ]]; then
-    pack_name="$(python3 -c "import json; d=json.load(open('manifest.json','r',encoding='utf-8')); print(d.get('name',''))" 2>/dev/null | tr -d '\r\n')" || pack_name=""
-    pack_version="$(python3 -c "import json; d=json.load(open('manifest.json','r',encoding='utf-8')); print(d.get('version',''))" 2>/dev/null | tr -d '\r\n')" || pack_version=""
+    pack_name="$(jq -r '.name // empty' manifest.json 2>/dev/null | tr -d '\r\n')" || pack_name=""
+    pack_version="$(jq -r '.version // empty' manifest.json 2>/dev/null | tr -d '\r\n')" || pack_version=""
   fi
 
   # Modrinth — modrinth.index.json
   if [[ -z "$pack_name" && -f "./modrinth.index.json" ]]; then
-    pack_name="$(python3 -c "import json; d=json.load(open('modrinth.index.json','r',encoding='utf-8')); print(d.get('name',''))" 2>/dev/null | tr -d '\r\n')" || pack_name=""
-    pack_version="$(python3 -c "import json; d=json.load(open('modrinth.index.json','r',encoding='utf-8')); print(d.get('versionId',''))" 2>/dev/null | tr -d '\r\n')" || pack_version=""
+    pack_name="$(jq -r '.name // empty' modrinth.index.json 2>/dev/null | tr -d '\r\n')" || pack_name=""
+    pack_version="$(jq -r '.versionId // empty' modrinth.index.json 2>/dev/null | tr -d '\r\n')" || pack_version=""
   fi
 
-  # FTB — version.json (written by the FTB serversetup installer)
+  # FTB — version.json
   if [[ -z "$pack_name" && -f "./version.json" ]]; then
-    pack_name="$(python3 -c "
-import json
-d=json.load(open('version.json','r',encoding='utf-8'))
-# FTB version.json has 'name' at top level or nested under 'pack'
-name=d.get('name','') or d.get('pack',{}).get('name','')
-print(name)
-" 2>/dev/null | tr -d '\r\n')" || pack_name=""
-    pack_version="$(python3 -c "
-import json
-d=json.load(open('version.json','r',encoding='utf-8'))
-ver=d.get('version','') or d.get('pack',{}).get('version','')
-print(ver)
-" 2>/dev/null | tr -d '\r\n')" || pack_version=""
+    pack_name="$(jq -r '(.name // .pack.name) // empty' version.json 2>/dev/null | tr -d '\r\n')" || pack_name=""
+    pack_version="$(jq -r '(.version // .pack.version) // empty' version.json 2>/dev/null | tr -d '\r\n')" || pack_version=""
   fi
 
   # Standalone server types — use a friendly label if no pack name found
@@ -1754,21 +1719,23 @@ print(ver)
   local _fid="${RESOLVED_VERSION_ID:-${VERSION_ID_NORM:-}}"
   local _mc="${MC_VER:-<unknown>}"
   local _loader="${LOADER:-<unknown>}"
+  local _ts
+  _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown')"
 
-  python3 -c "
-import json, datetime
-info = {
-  'provider':     '$_prov',
-  'pack_id':      '$_pid',
-  'file_id':      '$_fid',
-  'pack_name':    '$pack_name',
-  'pack_version': '$pack_version',
-  'mc_version':   '$_mc',
-  'loader':       '$_loader',
-  'updated_at':   datetime.datetime.utcnow().isoformat() + 'Z',
-}
-json.dump(info, open('.bb_pack_info.json','w'), indent=2)
-" 2>/dev/null && log "Pack info written to .bb_pack_info.json" || log "WARN: Could not write .bb_pack_info.json"
+  # Write JSON using jq (no python3 dependency)
+  jq -n \
+    --arg provider  "$_prov" \
+    --arg pack_id   "$_pid" \
+    --arg file_id   "$_fid" \
+    --arg pack_name "$pack_name" \
+    --arg pack_ver  "$pack_version" \
+    --arg mc_ver    "$_mc" \
+    --arg loader    "$_loader" \
+    --arg updated   "$_ts" \
+    '{provider:$provider,pack_id:$pack_id,file_id:$file_id,pack_name:$pack_name,pack_version:$pack_ver,mc_version:$mc_ver,loader:$loader,updated_at:$updated}' \
+    > .bb_pack_info.json 2>/dev/null \
+    && log "Pack info written to .bb_pack_info.json" \
+    || log "WARN: Could not write .bb_pack_info.json"
 }
 write_pack_info
 
