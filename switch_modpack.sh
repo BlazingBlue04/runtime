@@ -1778,7 +1778,9 @@ if [[ "${CLEAN_CLIENT_MODS:-false}" == "true" || "${CLEAN_CLIENT_MODS:-false}" =
       log "CLEAN_CLIENT_MODS=true but provider=${PROVIDER} has no mods — skipping client mod cleaner."
       ;;
     *)
-      if [[ -f "./clientmod_cleaner.sh" ]]; then
+      if [[ ! -d "./mods" ]]; then
+        log "CLEAN_CLIENT_MODS=true but no mods/ folder found — skipping client mod cleaner."
+      elif [[ -f "./clientmod_cleaner.sh" ]]; then
         log "CLEAN_CLIENT_MODS=true — running client mod cleaner..."
         bash ./clientmod_cleaner.sh --apply
       else
