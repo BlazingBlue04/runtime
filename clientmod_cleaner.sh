@@ -241,6 +241,10 @@ if "$RESTORE"; then
     log "No disabled mods directory at $DISABLED_DIR — nothing to restore."
     exit 0
   fi
+  if [[ ! -d "$MODS_DIR" ]]; then
+    log "No mods directory at $MODS_DIR — nothing to restore into."
+    exit 0
+  fi
   log "Restoring mods from $DISABLED_DIR -> $MODS_DIR..."
   count=0
   for jar in "$DISABLED_DIR"/*.jar; do
@@ -264,8 +268,8 @@ fi
 # SCAN MODE
 # =============================================================================
 if [[ ! -d "$MODS_DIR" ]]; then
-  log "ERROR: mods directory not found at $MODS_DIR"
-  exit 1
+  log "No mods directory found at $MODS_DIR — skipping client mod cleaner."
+  exit 0
 fi
 
 mkdir -p "$DISABLED_DIR"
