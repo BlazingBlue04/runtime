@@ -58,8 +58,11 @@ json_get() {
 echo "[curseforge] Retrieving project info for ${PACK_ID}..."
 MOD_JSON="$(req_json "/v1/mods/${PACK_ID}")"
 
-# Validate pack exists before we do anything destructive
-if [[ -z "$MOD_JSON" ]] || echo "$MOD_JSON" | json_get '.data' | grep -q "null"; then
+# Validate pack exists
+if [[ -z "$MOD_JSON" ]]; then
+  die "Pack ID ${PACK_ID} not found on CurseForge. Check PACK_ID is correct before reinstalling."
+fi
+if echo "$MOD_JSON" | jq -e '.data == null or .data.id == null' >/dev/null 2>&1; then
   die "Pack ID ${PACK_ID} not found on CurseForge. Check PACK_ID is correct before reinstalling."
 fi
 
