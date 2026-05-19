@@ -315,14 +315,103 @@ fi
 # Desired key (include MC_VERSION for vanilla/paper so version changes trigger reinstall)
 # For CurseForge, resolve "latest" to the actual file ID so restarts don't re-download
 # when the pack hasn't changed. The resolved ID gets stored in .bb_resolved_file_id.
+#
+# When VERSION_ID=latest we also check the live CF API to see if mainFileId has changed
+# since the last install. If it has, we clear the stored ID so a reinstall is triggered.
 RESOLVED_VERSION_ID="${VERSION_ID_NORM:-latest}"
 if [[ "${PROVIDER:-}" == "curseforge" && "${VERSION_ID_NORM:-latest}" == "latest" && -n "${PACK_ID_NORM:-}" ]]; then
+  _stored_resolved=""
   if [[ -f ".bb_resolved_file_id" ]]; then
     _stored_resolved="$(cat ".bb_resolved_file_id" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ -n "$_stored_resolved" ]]; then
+  fi
+
+  if [[ -n "$_stored_resolved" ]]; then
+    # We have a stored ID — check whether CF still reports the same mainFileId.
+    # Skip the live check if CF_API_KEY isn't set (e.g. non-CF configs).
+    if [[ -n "${CF_API_KEY:-}" ]]; then
+      log "VERSION_ID=latest: checking CurseForge for updates to pack ${PACK_ID_NORM}..."
+      _live_main_file_id="$(curl -fsSL --retry 2 --max-time 10 \
+        -H "Accept: application/json" \
+        -H "x-api-key: ${CF_API_KEY}" \
+        "https://api.curseforge.com/v1/mods/${PACK_ID_NORM}" 2>/dev/null \
+        | jq -r '.data.mainFileId // empty' 2>/dev/null | tr -d '[:space:]' || true)"
+
+      if [[ -n "$_live_main_file_id" && "$_live_main_file_id" != "null" ]]; then
+        if [[ "$_live_main_file_id" != "$_stored_resolved" ]]; then
+          log "New CurseForge version detected: stored=${_stored_resolved} live=${_live_main_file_id} — will reinstall."
+          rm -f ".bb_resolved_file_id" 2>/dev/null || true
+          # Leave RESOLVED_VERSION_ID as "latest"; curseforge_install.sh will resolve it properly
+        else
+          log "Pack is up to date (file id=${_stored_resolved}) — skipping reinstall."
+          RESOLVED_VERSION_ID="$_stored_resolved"
+        fi
+      else
+        # API call failed or returned nothing — fall back to stored ID to avoid unnecessary reinstall
+        log "WARN: Could not reach CurseForge API to check for updates — using stored file ID ${_stored_resolved}."
+        RESOLVED_VERSION_ID="$_stored_resolved"
+      fi
+    else
+      # No API key available — just use stored ID as before
       RESOLVED_VERSION_ID="$_stored_resolved"
-      debug "Using stored resolved file ID: $RESOLVED_VERSION_ID"
+      debug "Using stored resolved file ID (no API key for live check): $RESOLVED_VERSION_ID"
     fi
+  fi
+fi
+
+# For Modrinth: when VERSION_ID=latest, check live API for the latest version and store it
+# so restarts don't reinstall when the pack hasn't changed, but DO reinstall when it has.
+if [[ "${PROVIDER:-}" == "modrinth" && "${VERSION_ID_NORM:-latest}" == "latest" && -n "${PACK_ID_NORM:-}" ]]; then
+  _mr_stored=""
+  if [[ -f ".bb_resolved_mr_version" ]]; then
+    _mr_stored="$(cat ".bb_resolved_mr_version" 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+  log "VERSION_ID=latest: checking Modrinth for latest version of ${PACK_ID_NORM}..."
+  _mr_live="$(curl -fsSL --retry 2 --max-time 10 \
+    "https://api.modrinth.com/v2/project/${PACK_ID_NORM}/version" 2>/dev/null \
+    | jq -r 'sort_by(.date_published) | reverse | .[0].id // empty' 2>/dev/null | tr -d '[:space:]' || true)"
+
+  if [[ -n "$_mr_live" && "$_mr_live" != "null" ]]; then
+    if [[ -n "$_mr_stored" && "$_mr_live" == "$_mr_stored" ]]; then
+      log "Modrinth pack is up to date (version=${_mr_stored}) — skipping reinstall."
+      VERSION_ID_NORM="$_mr_stored"
+    elif [[ -n "$_mr_stored" ]]; then
+      log "New Modrinth version detected: stored=${_mr_stored} live=${_mr_live} — will reinstall."
+      rm -f ".bb_resolved_mr_version" 2>/dev/null || true
+      # Leave VERSION_ID_NORM as latest so modrinth_install.sh resolves it
+    else
+      log "No stored Modrinth version — will install latest (${_mr_live})."
+    fi
+  else
+    log "WARN: Could not reach Modrinth API — using stored version if available."
+    [[ -n "$_mr_stored" ]] && VERSION_ID_NORM="$_mr_stored" || true
+  fi
+fi
+
+# For FTB: same pattern using the FTB API
+if [[ "${PROVIDER:-}" == "ftb" && "${VERSION_ID_NORM:-latest}" == "latest" && -n "${PACK_ID_NORM:-}" ]]; then
+  _ftb_stored=""
+  if [[ -f ".bb_resolved_ftb_version" ]]; then
+    _ftb_stored="$(cat ".bb_resolved_ftb_version" 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+  log "VERSION_ID=latest: checking FTB API for latest version of pack ${PACK_ID_NORM}..."
+  _ftb_live="$(curl -fsSL --retry 2 --max-time 10 \
+    "https://api.feed-the-beast.com/v1/modpacks/public/modpack/${PACK_ID_NORM}" 2>/dev/null \
+    | jq -r '[.versions[] | select(.type == "Release")] | sort_by(.updated) | reverse | .[0].id // empty' \
+    2>/dev/null | tr -d '[:space:]' || true)"
+
+  if [[ -n "$_ftb_live" && "$_ftb_live" != "null" ]]; then
+    if [[ -n "$_ftb_stored" && "$_ftb_live" == "$_ftb_stored" ]]; then
+      log "FTB pack is up to date (version id=${_ftb_stored}) — skipping reinstall."
+      VERSION_ID_NORM="$_ftb_stored"
+    elif [[ -n "$_ftb_stored" ]]; then
+      log "New FTB version detected: stored=${_ftb_stored} live=${_ftb_live} — will reinstall."
+      rm -f ".bb_resolved_ftb_version" 2>/dev/null || true
+    else
+      log "No stored FTB version — will install latest (${_ftb_live})."
+    fi
+  else
+    log "WARN: Could not reach FTB API — using stored version if available."
+    [[ -n "$_ftb_stored" ]] && VERSION_ID_NORM="$_ftb_stored" || true
   fi
 fi
 
@@ -385,9 +474,31 @@ fi
 # Deep wipe (preserve important folders)
 # ---------------------------------------
 deep_wipe() {
-  log "Deep wiping server directory (keeping backups/archives + scripts + world-backups)..."
+  log "Deep wiping server directory (keeping world, player data, configs, backups, and scripts)..."
   mkdir -p .bb_tmp_preserve
-  # Preserve common backup folders and our install scripts
+
+  # --- Resolve world folder name from server.properties (default: world) ---
+  local _level_name="world"
+  if [[ -f "./server.properties" ]]; then
+    local _ln
+    _ln="$(grep -E '^level-name\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')"
+    [[ -n "${_ln:-}" ]] && _level_name="$_ln"
+  fi
+
+  # --- World folders ---
+  for p in "$_level_name" "${_level_name}_nether" "${_level_name}_the_end" \
+            "world" "world_nether" "world_the_end" "DIM-1" "DIM1"; do
+    [[ -e "$p" ]] && mv "$p" .bb_tmp_preserve/ 2>/dev/null || true
+  done
+
+  # --- Player data & server identity files ---
+  for p in ops.json whitelist.json banned-players.json banned-ips.json \
+            usercache.json usernamecache.json server.properties eula.txt \
+            server-icon.png; do
+    [[ -e "$p" ]] && cp -a "$p" .bb_tmp_preserve/ 2>/dev/null || true
+  done
+
+  # --- Preserve common backup folders and our install scripts ---
   for p in backups archives world-backups .bb_backups; do
     [[ -e "$p" ]] && mv "$p" .bb_tmp_preserve/ 2>/dev/null || true
   done
@@ -417,6 +528,7 @@ deep_wipe() {
   done
   shopt -u dotglob nullglob
   rm -rf .bb_tmp_preserve || true
+  log "Wipe complete. Preserved: world='${_level_name}', ops/whitelist/bans, server.properties, eula.txt."
 
   # Re-download any runtime scripts that didn't survive the wipe
   # (shouldn't happen since we preserve them above, but safety net)
@@ -1670,6 +1782,35 @@ if [[ "$need_reinstall" -eq 1 ]]; then
     desired_key="curseforge::${PACK_ID_NORM:-}::${CF_FILE_ID}"
     log "Stored resolved CurseForge file ID: ${CF_FILE_ID}"
   fi
+
+  # After Modrinth install, store the resolved version ID for update checks on future boots
+  if [[ "${PROVIDER:-}" == "modrinth" && "${VERSION_ID_NORM:-latest}" != "latest" ]]; then
+    echo "${VERSION_ID_NORM}" > ".bb_resolved_mr_version"
+    log "Stored resolved Modrinth version ID: ${VERSION_ID_NORM}"
+  elif [[ "${PROVIDER:-}" == "modrinth" ]]; then
+    # VERSION_ID_NORM was "latest" — resolve and store what was actually installed
+    _mr_installed="$(curl -fsSL --retry 2 --max-time 10 \
+      "https://api.modrinth.com/v2/project/${PACK_ID_NORM:-}/version" 2>/dev/null \
+      | jq -r 'sort_by(.date_published) | reverse | .[0].id // empty' 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ -n "$_mr_installed" && "$_mr_installed" != "null" ]] && \
+      echo "$_mr_installed" > ".bb_resolved_mr_version" && \
+      log "Stored resolved Modrinth version ID (post-install): ${_mr_installed}" || true
+  fi
+
+  # After FTB install, store the resolved version ID for update checks on future boots
+  if [[ "${PROVIDER:-}" == "ftb" && "${VERSION_ID_NORM:-latest}" != "latest" ]]; then
+    echo "${VERSION_ID_NORM}" > ".bb_resolved_ftb_version"
+    log "Stored resolved FTB version ID: ${VERSION_ID_NORM}"
+  elif [[ "${PROVIDER:-}" == "ftb" ]]; then
+    _ftb_installed="$(curl -fsSL --retry 2 --max-time 10 \
+      "https://api.feed-the-beast.com/v1/modpacks/public/modpack/${PACK_ID_NORM:-}" 2>/dev/null \
+      | jq -r '[.versions[] | select(.type == "Release")] | sort_by(.updated) | reverse | .[0].id // empty' \
+      2>/dev/null | tr -d '[:space:]' || true)"
+    [[ -n "$_ftb_installed" && "$_ftb_installed" != "null" ]] && \
+      echo "$_ftb_installed" > ".bb_resolved_ftb_version" && \
+      log "Stored resolved FTB version ID (post-install): ${_ftb_installed}" || true
+  fi
+
   echo "$desired_key" > "$LOCK_FILE"
   log "Install complete. Lock updated."
 fi
