@@ -44,20 +44,18 @@ fi
 XMX_MB=$(( RAW_MB * 85 / 100 ))
 XMS_MB=$(( RAW_MB * 25 / 100 ))
 
-# Convert to GB if clean, otherwise keep as MB
+# Display as GB when clean, otherwise MB (the actual flag always uses MB)
+XMX="${XMX_MB}M"
 if (( XMX_MB % 1024 == 0 )); then
-  XMX="${XMX_MB}M"
   XMX_DISPLAY="$(( XMX_MB / 1024 ))G"
 else
-  XMX="${XMX_MB}M"
   XMX_DISPLAY="${XMX_MB}M"
 fi
 
+XMS="${XMS_MB}M"
 if (( XMS_MB % 1024 == 0 )); then
-  XMS="${XMS_MB}M"
   XMS_DISPLAY="$(( XMS_MB / 1024 ))G"
 else
-  XMS="${XMS_MB}M"
   XMS_DISPLAY="${XMS_MB}M"
 fi
 
