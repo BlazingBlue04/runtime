@@ -255,15 +255,23 @@ for _script in "${RUNTIME_SCRIPTS[@]}"; do
   _url="${RUNTIME_RAW_BASE}/${_script}"
   if curl -fsSL --retry 3 --retry-delay 2 --max-time 10 "$_url" -o "./${_script}.tmp" 2>/dev/null; then
     sed -i 's/\r$//' "./${_script}.tmp" 2>/dev/null || true
-    mv "./${_script}.tmp" "./${_script}"
-    chmod +x "./${_script}"
-    log "Updated ${_script} from GitHub"
+    # Validate before replacing — a bad download must never clobber a working script
+    _sz="$(wc -c < "./${_script}.tmp" 2>/dev/null || echo 0)"
+    _sb="$(head -n1 "./${_script}.tmp" 2>/dev/null | grep -c '#!/' || true)"
+    if [[ "$_sz" -lt 200 || "$_sb" -eq 0 ]]; then
+      rm -f "./${_script}.tmp"
+      log "WARN: Downloaded ${_script} looks invalid (size=${_sz}) — keeping existing version"
+    else
+      mv "./${_script}.tmp" "./${_script}"
+      chmod +x "./${_script}"
+      log "Updated ${_script} from GitHub"
+    fi
   else
     rm -f "./${_script}.tmp"
     log "WARN: Could not update ${_script} from GitHub — using existing version"
   fi
 done
-unset _script _url
+unset _script _url _sz _sb
 
 # Self-update switch_modpack.sh and re-exec if it changed.
 # Use a file flag (.bb_self_updated) instead of an env var — env vars are not
@@ -273,7 +281,14 @@ if [[ ! -f "$BB_SELF_UPDATED_FLAG" ]]; then
   _self_url="${RUNTIME_RAW_BASE}/switch_modpack.sh"
   if curl -fsSL --retry 3 --retry-delay 2 --max-time 10 "$_self_url" -o "./switch_modpack.sh.tmp" 2>/dev/null; then
     sed -i 's/\r$//' "./switch_modpack.sh.tmp" 2>/dev/null || true
-    if ! diff -q "./switch_modpack.sh.tmp" "./switch_modpack.sh" >/dev/null 2>&1; then
+    # Validate the download: must be non-empty and contain our shebang before replacing.
+    # A bad/empty download would silently destroy the script and break all servers.
+    _tmp_size="$(wc -c < "./switch_modpack.sh.tmp" 2>/dev/null || echo 0)"
+    _tmp_has_shebang="$(head -n1 "./switch_modpack.sh.tmp" 2>/dev/null | grep -c '#!/' || true)"
+    if [[ "$_tmp_size" -lt 1000 || "$_tmp_has_shebang" -eq 0 ]]; then
+      rm -f "./switch_modpack.sh.tmp"
+      log "WARN: Downloaded switch_modpack.sh looks invalid (size=${_tmp_size}) — keeping existing version"
+    elif ! diff -q "./switch_modpack.sh.tmp" "./switch_modpack.sh" >/dev/null 2>&1; then
       mv "./switch_modpack.sh.tmp" "./switch_modpack.sh"
       chmod +x "./switch_modpack.sh"
       log "switch_modpack.sh updated from GitHub — re-execing..."
@@ -307,7 +322,7 @@ if [[ -f "$LOCK_FILE" ]]; then
 fi
 
 # If user didn't provide CF_PROJECT_ID, try to "self-learn" it from the lock (so restarts work).
-if [[ -z "${CF_PROJECT_ID}" && "$current_key" =~ ^curseforge:([0-9]+): ]]; then
+if [[ -z "${CF_PROJECT_ID}" && "$current_key" =~ ^curseforge::([0-9]+):: ]]; then
   CF_PROJECT_ID="${BASH_REMATCH[1]}"
   debug "CF_PROJECT_ID inferred from lock: $CF_PROJECT_ID"
 fi
@@ -420,6 +435,33 @@ case "${PROVIDER:-unknown}" in
     desired_key="${PROVIDER:-unknown}::${MC_VERSION:-latest}::${VERSION_ID_NORM:-latest}"
     ;;
   curseforge)
+    # If RESOLVED_VERSION_ID is still "latest" here it means we have no stored ID yet
+    # (first install, or .bb_resolved_file_id was deleted). Resolve it via the CF API now
+    # so desired_key is always a real numeric file ID, never "latest".
+    # Without this, desired_key="curseforge::ID::latest" never matches the lock file
+    # which has the real ID, causing a reinstall on every single boot.
+    if [[ "${RESOLVED_VERSION_ID}" == "latest" && -n "${PACK_ID_NORM:-}" && -n "${CF_API_KEY:-}" ]]; then
+      log "RESOLVED_VERSION_ID=latest and no stored ID — resolving mainFileId from CurseForge API..."
+      _cf_main="$(curl -fsSL --retry 2 --max-time 10 \
+        -H "Accept: application/json" \
+        -H "x-api-key: ${CF_API_KEY}" \
+        "https://api.curseforge.com/v1/mods/${PACK_ID_NORM}" 2>/dev/null \
+        | jq -r '.data.mainFileId // empty' 2>/dev/null | tr -d '[:space:]' || true)"
+      if [[ -n "$_cf_main" && "$_cf_main" != "null" && "$_cf_main" != "0" ]]; then
+        RESOLVED_VERSION_ID="$_cf_main"
+        # Persist so the next boot uses the stored-ID fast path instead of re-resolving
+        echo "${RESOLVED_VERSION_ID}" > ".bb_resolved_file_id" 2>/dev/null || true
+        log "Pre-resolved CurseForge file ID: ${RESOLVED_VERSION_ID}"
+      fi
+    fi
+    # Last-resort safety net: if we STILL have "latest" (API unreachable) but the lock
+    # already holds a numeric ID for this exact pack, adopt the lock's ID rather than
+    # wiping a working server just because the API was briefly down.
+    if [[ "${RESOLVED_VERSION_ID}" == "latest" && \
+          "$current_key" =~ ^curseforge::${PACK_ID_NORM:-}::([0-9]+)$ ]]; then
+      RESOLVED_VERSION_ID="${BASH_REMATCH[1]}"
+      log "WARN: CF API unreachable — keeping installed file ID ${RESOLVED_VERSION_ID} from lock (no reinstall)."
+    fi
     desired_key="curseforge::${PACK_ID_NORM:-}::${RESOLVED_VERSION_ID}"
     ;;
   modrinth|ftb)
@@ -455,9 +497,15 @@ if [[ -x "./startserver.sh" || -f "./startserver.sh" ]]; then has_any_start_arti
 if [[ -x "./LaunchServer.sh" || -f "./LaunchServer.sh" ]]; then has_any_start_artifact=1; fi
 if [[ -x "./ServerStart.sh" || -f "./ServerStart.sh" ]]; then has_any_start_artifact=1; fi
 if [[ -x "./StartServer.sh" || -f "./StartServer.sh" ]]; then has_any_start_artifact=1; fi
-if [[ -f "./server.jar" || -f "./minecraft_server.jar" || -f "./minecraft_server.*.jar" ]]; then has_any_start_artifact=1; fi
+if [[ -f "./server.jar" || -f "./minecraft_server.jar" ]]; then has_any_start_artifact=1; fi
+if [[ -f "./start-server.jar" ]]; then has_any_start_artifact=1; fi          # FTB installs rename forge-*.jar to this
+if [[ -f "./unix_args.txt" || -L "./unix_args.txt" ]]; then has_any_start_artifact=1; fi  # FTB/modern Forge argfile symlink
+if has_glob "./minecraft_server.*.jar"; then has_any_start_artifact=1; fi
 if has_glob "./forge-*.jar"; then has_any_start_artifact=1; fi
-if [[ -f "./libraries/net/neoforged/neoforge/"*/unix_args.txt ]]; then has_any_start_artifact=1; fi
+if has_glob "./fabric-server-launch*.jar"; then has_any_start_artifact=1; fi
+if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
+if has_glob "./libraries/net/neoforged/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
+if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if [[ "$has_any_start_artifact" -eq 0 ]]; then
   need_reinstall=1
   log "Start artifacts missing; forcing reinstall."
@@ -511,13 +559,6 @@ deep_wipe() {
     # keep preserve dir itself
     [[ "$x" == ".bb_tmp_preserve" ]] && continue
     rm -rf -- "$x" || true
-  done
-  shopt -u dotglob nullglob
-
-  # restore
-  shopt -s dotglob nullglob
-  for x in .bb_tmp_preserve/*; do
-    mv "$x" ./ 2>/dev/null || true
   done
   shopt -u dotglob nullglob
 
@@ -1899,6 +1940,52 @@ if [[ "${WIPE_WORLD:-0}" == "1" || "${WIPE_WORLD:-0}" == "true" ]]; then
   log "World wipe complete. A new world will generate on next startup."
   log "⚠ Set WIPE_WORLD back to 0 in startup variables to avoid wiping again on the next restart."
 fi
+# ---------------------------------------
+# server-port patch — writes SERVER_PORT into server.properties every boot.
+# Pterodactyl sets SERVER_PORT. We patch it here so switching modpacks (which
+# may ship their own server.properties with port=25565) never breaks the server.
+# If server.properties doesn't exist yet (first boot), we create a minimal one
+# so the port is correct from the very first launch.
+# ---------------------------------------
+patch_server_port() {
+  local port="${SERVER_PORT:-}"
+  if [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
+    log "SERVER_PORT not set or not numeric — skipping port patch."
+    return 0
+  fi
+
+  case "${PROVIDER:-}" in
+    bedrock|vanilla_bedrock)
+      log "Bedrock server — skipping Java server.properties port patch."
+      return 0 ;;
+  esac
+
+  if [[ -f "./server.properties" ]]; then
+    local current_port
+    current_port="$(grep -E '^server-port\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')"
+    if [[ "$current_port" == "$port" ]]; then
+      log "server.properties: server-port already set to ${port} — no change needed."
+    elif [[ -n "$current_port" ]]; then
+      sed -i "s/^server-port\s*=.*/server-port=${port}/" ./server.properties
+      log "server.properties: patched server-port ${current_port} -> ${port}"
+    else
+      # File exists but has no server-port line (some packs ship partial files) — append it
+      printf '\nserver-port=%s\n' "${port}" >> ./server.properties
+      log "server.properties: no server-port line found — appended server-port=${port}"
+    fi
+  else
+    # server.properties doesn't exist yet — write a minimal stub so port is correct on first launch.
+    # Minecraft will fill in the rest of the defaults on first boot.
+    log "server.properties not found — writing stub with server-port=${port} (Minecraft will fill defaults on first launch)."
+    cat > ./server.properties << EOF
+# Written by BlazingBlue switch_modpack.sh — Minecraft will add remaining defaults on first launch.
+server-port=${port}
+online-mode=true
+EOF
+  fi
+}
+patch_server_port
+
 # JVM args generator — regenerates user_jvm_args.txt based on SERVER_MEMORY
 # Ensures correct heap size even if RAM allocation changes between boots.
 # ---------------------------------------
