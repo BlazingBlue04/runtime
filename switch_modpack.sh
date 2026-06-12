@@ -103,7 +103,7 @@ DIR="${SERVER_DIR:-/home/container}"
 cd "$DIR"
 
 DEBUG="${DEBUG:-0}"
-debug(){ [[ "$DEBUG" == "1" || "$DEBUG" == "true" ]] && echo "[switch][debug] $*"; }
+debug(){ if [[ "$DEBUG" == "1" || "$DEBUG" == "true" ]]; then echo "[switch][debug] $*"; fi; return 0; }
 
 has_glob() { compgen -G "$1" >/dev/null 2>&1; }
 
@@ -155,8 +155,11 @@ compute_ram_env() {
     return
   fi
 
-  # Use the full container memory limit for Xmx (Pterodactyl already enforces the limit)
-  local xmx_mb=$(( mem_mb ))
+  # Use 85% of the container limit for Xmx — the JVM needs headroom beyond heap
+  # (metaspace, native allocations, GC overhead). Heap == container limit is a
+  # classic cause of random cgroup OOM kills (exit 137) hours into a session.
+  # This matches the 85% used by generate_jvm_args.sh.
+  local xmx_mb=$(( mem_mb * 85 / 100 ))
   # Round down to nearest 256MB
   xmx_mb=$(( (xmx_mb / 256) * 256 ))
   # Minimum 1024MB
@@ -394,7 +397,15 @@ if [[ "${PROVIDER:-}" == "modrinth" && "${VERSION_ID_NORM:-latest}" == "latest" 
       rm -f ".bb_resolved_mr_version" 2>/dev/null || true
       # Leave VERSION_ID_NORM as latest so modrinth_install.sh resolves it
     else
-      log "No stored Modrinth version — will install latest (${_mr_live})."
+      # No stored version file — self-heal: if the lock already shows this exact
+      # live version installed, adopt it instead of triggering a reinstall.
+      if [[ "$current_key" == "modrinth::${PACK_ID_NORM:-}::${_mr_live}" ]]; then
+        VERSION_ID_NORM="$_mr_live"
+        echo "$_mr_live" > ".bb_resolved_mr_version" 2>/dev/null || true
+        log "Lock already matches live Modrinth version ${_mr_live} — restored stored ID, skipping reinstall."
+      else
+        log "No stored Modrinth version — will install latest (${_mr_live})."
+      fi
     fi
   else
     log "WARN: Could not reach Modrinth API — using stored version if available."
@@ -422,7 +433,14 @@ if [[ "${PROVIDER:-}" == "ftb" && "${VERSION_ID_NORM:-latest}" == "latest" && -n
       log "New FTB version detected: stored=${_ftb_stored} live=${_ftb_live} — will reinstall."
       rm -f ".bb_resolved_ftb_version" 2>/dev/null || true
     else
-      log "No stored FTB version — will install latest (${_ftb_live})."
+      # No stored version file — self-heal from the lock if it matches live
+      if [[ "$current_key" == "ftb::${PACK_ID_NORM:-}::${_ftb_live}" ]]; then
+        VERSION_ID_NORM="$_ftb_live"
+        echo "$_ftb_live" > ".bb_resolved_ftb_version" 2>/dev/null || true
+        log "Lock already matches live FTB version ${_ftb_live} — restored stored ID, skipping reinstall."
+      else
+        log "No stored FTB version — will install latest (${_ftb_live})."
+      fi
     fi
   else
     log "WARN: Could not reach FTB API — using stored version if available."
@@ -503,6 +521,7 @@ if [[ -f "./unix_args.txt" || -L "./unix_args.txt" ]]; then has_any_start_artifa
 if has_glob "./minecraft_server.*.jar"; then has_any_start_artifact=1; fi
 if has_glob "./forge-*.jar"; then has_any_start_artifact=1; fi
 if has_glob "./fabric-server-launch*.jar"; then has_any_start_artifact=1; fi
+if has_glob "./quilt-server-launch*.jar"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then has_any_start_artifact=1; fi
@@ -696,21 +715,32 @@ run_installer() {
       local bv="${BEDROCK_VERSION:-latest}"
       local bc="${BEDROCK_CHANNEL:-release}"
       log "Installing Bedrock server (version=$bv channel=$bc)..."
-      local api_url="https://raw.githubusercontent.com/jhead/phantom/master/bedrock_versions.json"
       local dl_url=""
+      local _ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
       if [[ "$bv" == "latest" ]]; then
-        # Try to get download URL from Mojang's download page (x86_64 Linux)
-        local page
-        page="$(curl -fsSL --retry 3 --max-time 15 \
-          "https://www.minecraft.net/en-us/download/server/bedrock" 2>/dev/null || true)"
-        dl_url="$(echo "$page" | grep -oP 'https://[^"]+bin-linux/[^"]+\.zip' | head -1 || true)"
+        # 1) Official Mojang links API (serverBedrockLinux)
+        local links_json
+        links_json="$(curl -fsSL -A "$_ua" --retry 3 --max-time 15 \
+          "https://net-secondary.web.minecraft-services.net/api/v1.0/download/links" 2>/dev/null || true)"
+        if [[ -n "$links_json" ]]; then
+          dl_url="$(echo "$links_json" | jq -r '.result.links[]? | select(.downloadType == "serverBedrockLinux") | .downloadUrl' 2>/dev/null | head -1 || true)"
+        fi
+        # 2) Fallback: scrape the download page with a browser UA (blocked without one)
+        if [[ -z "$dl_url" ]]; then
+          local page
+          page="$(curl -fsSL -A "$_ua" --retry 3 --max-time 15 \
+            "https://www.minecraft.net/en-us/download/server/bedrock" 2>/dev/null || true)"
+          dl_url="$(echo "$page" | grep -oP 'https://[^"]+bin-linux/[^"]+\.zip' | head -1 || true)"
+        fi
+        [[ -z "$dl_url" ]] && { err "Could not determine latest Bedrock server download URL (Mojang API and page scrape both failed)."; exit 1; }
+      else
+        # Pinned version — current CDN path on minecraft.net
+        dl_url="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-${bv}.zip"
       fi
-      if [[ -z "$dl_url" ]]; then
-        # Fallback: direct versioned URL pattern
-        dl_url="https://minecraft.azureedge.net/bin-linux/bedrock-server-${bv}.zip"
-      fi
+
       log "Downloading Bedrock server: $dl_url"
-      curl -fsSL --retry 3 --max-time 120 -o bedrock-server.zip "$dl_url" \
+      curl -fsSL -A "$_ua" --retry 3 --max-time 300 -o bedrock-server.zip "$dl_url" \
         || { err "Failed to download Bedrock server from $dl_url"; exit 1; }
       unzip -o bedrock-server.zip -d . && rm -f bedrock-server.zip
       chmod +x bedrock_server 2>/dev/null || true
@@ -967,8 +997,9 @@ detect_loader() {
       quilt-*)    echo "quilt"; return ;;
     esac
   fi
-  # Detect from start script content
+  # Detect from start script content (check neoforge BEFORE forge — "forge" matches "neoforge")
   for sf in ./ServerStart.sh ./startserver.sh ./run.sh; do
+    if [[ -f "$sf" ]] && grep -qi 'neoforge' "$sf" 2>/dev/null; then echo "neoforge"; return; fi
     if [[ -f "$sf" ]] && grep -qi 'quilt' "$sf" 2>/dev/null; then echo "quilt"; return; fi
     if [[ -f "$sf" ]] && grep -qi 'forge' "$sf" 2>/dev/null; then echo "forge"; return; fi
   done
@@ -1087,7 +1118,9 @@ find_start_candidate() {
 
   # Any shell script in top-level or scripts/ (covers packs like RLCraft that ship oddly named scripts)
   local any_sh
-  any_sh="$(find . -maxdepth 2 -type f -name '*.sh' 2>/dev/null | grep -Ev '^\./(switch_modpack\.sh|curseforge_install\.sh|modrinth_install\.sh|ftb_install\.sh)$' | head -n 1 || true)"
+  any_sh="$(find . -maxdepth 2 -type f -name '*.sh' 2>/dev/null \
+    | grep -Ev '^\./(switch_modpack\.sh|curseforge_install\.sh|modrinth_install\.sh|ftb_install\.sh|clientmod_cleaner\.sh|generate_jvm_args\.sh|\.bb_tmp_start\.sh)$' \
+    | head -n 1 || true)"
   if [[ -n "$any_sh" ]]; then
     echo "$any_sh"
     return 0
@@ -1097,7 +1130,7 @@ find_start_candidate() {
 
 # Any obvious server jar at top-level
   local jar
-  jar="$(find . -maxdepth 2 -type f \( -iname 'server.jar' -o -iname 'minecraft_server*.jar' -o -iname 'forge-*.jar' -o -iname 'fabric-server-launch*.jar' -o -iname 'quilt-server-launch*.jar' -o -iname '*paper*.jar' \) 2>/dev/null | head -n 1 || true)"
+  jar="$(find . -maxdepth 2 -type f \( -iname 'server.jar' -o -iname 'start-server.jar' -o -iname 'minecraft_server*.jar' -o -iname 'forge-*.jar' -o -iname 'fabric-server-launch*.jar' -o -iname 'quilt-server-launch*.jar' -o -iname '*paper*.jar' \) 2>/dev/null | head -n 1 || true)"
   if [[ -n "$jar" ]]; then
     echo "JAR::$jar"
     return 0
@@ -1428,7 +1461,11 @@ run_start_candidate() {
       if [[ -f ./user_jvm_args.txt ]]; then
         exec "$JAVA" @./user_jvm_args.txt @"$unix_args" nogui
       else
-        exec "$JAVA" @"$unix_args" nogui
+        # No argfile with memory settings — pass them explicitly (direct exec bypasses the shim)
+        local _mf=()
+        if [[ -n "${MIN_RAM:-}" ]]; then _mf+=("-Xms${MIN_RAM}"); fi
+        if [[ -n "${MAX_RAM:-}" ]]; then _mf+=("-Xmx${MAX_RAM}"); fi
+        exec "$JAVA" "${_mf[@]}" @"$unix_args" nogui
       fi
       ;;
     JAR::* )
@@ -1448,7 +1485,10 @@ run_start_candidate() {
         exit 1
       fi
       log "Starting via jar: $jar"
-      exec "$JAVA" -jar "$jar" nogui
+      local _mf=()
+      if [[ -n "${MIN_RAM:-}" ]]; then _mf+=("-Xms${MIN_RAM}"); fi
+      if [[ -n "${MAX_RAM:-}" ]]; then _mf+=("-Xmx${MAX_RAM}"); fi
+      exec "$JAVA" "${_mf[@]}" -jar "$jar" nogui
       ;;
     * )
       log "Starting via script: $cand"
@@ -1507,7 +1547,7 @@ cf_manifest_detect() {
   [[ -f "$mf" ]] || return 1
 
   # Outputs: "<mc_version> <loader> <loader_version>"
-  python - <<'PY' 2>/dev/null || return 1
+  python3 - <<'PY' 2>/dev/null || return 1
 import json
 mf="manifest.json"
 j=json.load(open(mf,"r",encoding="utf-8"))
@@ -1727,9 +1767,21 @@ start_server() {
   fi
 
   # 3) Jar fallbacks
+  # NOTE: direct "$JAVA" execs bypass the PATH shim, so memory flags must be explicit
+  # here or the JVM defaults to ~25% of container RAM.
+  local _memflags=()
+  if [[ -n "${MIN_RAM:-}" ]]; then _memflags+=("-Xms${MIN_RAM}"); fi
+  if [[ -n "${MAX_RAM:-}" ]]; then _memflags+=("-Xmx${MAX_RAM}"); fi
+
   if [[ -f "./server.jar" ]]; then
-    log "Starting via server.jar"
-    exec "$JAVA" -jar ./server.jar nogui
+    log "Starting via server.jar (Xmx=${MAX_RAM:-default})"
+    exec "$JAVA" "${_memflags[@]}" -jar ./server.jar nogui
+  fi
+
+  # FTB installs rename the forge jar to start-server.jar
+  if [[ -f "./start-server.jar" ]]; then
+    log "Starting via start-server.jar (Xmx=${MAX_RAM:-default})"
+    exec "$JAVA" "${_memflags[@]}" -jar ./start-server.jar nogui
   fi
 
   # Prefer a top-level forge-*.jar.
@@ -1765,14 +1817,14 @@ start_server() {
         err "Forge installer finished but no runnable start method was produced."
         exit 1
       fi
-      exec "$JAVA" -jar "$j" nogui
+      exec "$JAVA" "${_memflags[@]}" -jar "$j" nogui
     else
       # Old Forge jars (1.12.2 and earlier) may still be launchable with -jar on Java 8.
       local java_ver_str=""
       java_ver_str="$("$JAVA" -version 2>&1 | head -n1 || true)"
       if [[ "$java_ver_str" =~ (1\.8\.|\"1\.8) ]]; then
         log "Starting via legacy Forge jar (Java 8): $j"
-        exec "$JAVA" -jar "$j" nogui
+        exec "$JAVA" "${_memflags[@]}" -jar "$j" nogui
       else
         warn "Refusing to start non-executable jar fallback (no Main-Class): $j"
       fi
@@ -1827,29 +1879,39 @@ if [[ "$need_reinstall" -eq 1 ]]; then
   # After Modrinth install, store the resolved version ID for update checks on future boots
   if [[ "${PROVIDER:-}" == "modrinth" && "${VERSION_ID_NORM:-latest}" != "latest" ]]; then
     echo "${VERSION_ID_NORM}" > ".bb_resolved_mr_version"
+    desired_key="modrinth::${PACK_ID_NORM:-}::${VERSION_ID_NORM}"
     log "Stored resolved Modrinth version ID: ${VERSION_ID_NORM}"
   elif [[ "${PROVIDER:-}" == "modrinth" ]]; then
     # VERSION_ID_NORM was "latest" — resolve and store what was actually installed
     _mr_installed="$(curl -fsSL --retry 2 --max-time 10 \
       "https://api.modrinth.com/v2/project/${PACK_ID_NORM:-}/version" 2>/dev/null \
       | jq -r 'sort_by(.date_published) | reverse | .[0].id // empty' 2>/dev/null | tr -d '[:space:]' || true)"
-    [[ -n "$_mr_installed" && "$_mr_installed" != "null" ]] && \
-      echo "$_mr_installed" > ".bb_resolved_mr_version" && \
-      log "Stored resolved Modrinth version ID (post-install): ${_mr_installed}" || true
+    if [[ -n "$_mr_installed" && "$_mr_installed" != "null" ]]; then
+      echo "$_mr_installed" > ".bb_resolved_mr_version"
+      # CRITICAL: also rewrite desired_key so the lock stores the real ID, not "latest".
+      # Otherwise the next boot resolves the real ID, mismatches the lock, and
+      # triggers a pointless second wipe+reinstall after every update.
+      desired_key="modrinth::${PACK_ID_NORM:-}::${_mr_installed}"
+      log "Stored resolved Modrinth version ID (post-install): ${_mr_installed}"
+    fi
   fi
 
   # After FTB install, store the resolved version ID for update checks on future boots
   if [[ "${PROVIDER:-}" == "ftb" && "${VERSION_ID_NORM:-latest}" != "latest" ]]; then
     echo "${VERSION_ID_NORM}" > ".bb_resolved_ftb_version"
+    desired_key="ftb::${PACK_ID_NORM:-}::${VERSION_ID_NORM}"
     log "Stored resolved FTB version ID: ${VERSION_ID_NORM}"
   elif [[ "${PROVIDER:-}" == "ftb" ]]; then
     _ftb_installed="$(curl -fsSL --retry 2 --max-time 10 \
       "https://api.feed-the-beast.com/v1/modpacks/public/modpack/${PACK_ID_NORM:-}" 2>/dev/null \
       | jq -r '[.versions[] | select(.type == "Release")] | sort_by(.updated) | reverse | .[0].id // empty' \
       2>/dev/null | tr -d '[:space:]' || true)"
-    [[ -n "$_ftb_installed" && "$_ftb_installed" != "null" ]] && \
-      echo "$_ftb_installed" > ".bb_resolved_ftb_version" && \
-      log "Stored resolved FTB version ID (post-install): ${_ftb_installed}" || true
+    if [[ -n "$_ftb_installed" && "$_ftb_installed" != "null" ]]; then
+      echo "$_ftb_installed" > ".bb_resolved_ftb_version"
+      # Same as Modrinth: lock must store the real ID, never "latest"
+      desired_key="ftb::${PACK_ID_NORM:-}::${_ftb_installed}"
+      log "Stored resolved FTB version ID (post-install): ${_ftb_installed}"
+    fi
   fi
 
   echo "$desired_key" > "$LOCK_FILE"
