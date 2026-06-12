@@ -55,34 +55,6 @@ jar_has() {
 # METADATA CHECKERS — each returns "client", "server", "both", or "unknown"
 # =============================================================================
 
-check_fabric_mod_json() {
-  local content="$1"
-  python3 - <<PY 2>/dev/null || echo "unknown"
-import json, sys
-try:
-    d = json.loads("""${content//\"/\\\"}""")
-    e = d.get('environment', d.get('env', ''))
-    if isinstance(e, str):
-        v = e.lower().strip()
-        if v == 'client': print('client')
-        elif v in ('server', 'dedicated_server'): print('server')
-        else: print('both')
-    elif isinstance(e, dict):
-        s = str(e.get('server', 'required')).lower()
-        c = str(e.get('client', 'required')).lower()
-        if s in ('unsupported',) and c in ('required', 'optional'):
-            print('client')
-        elif c in ('unsupported',):
-            print('server')
-        else:
-            print('both')
-    else:
-        print('unknown')
-except Exception:
-    print('unknown')
-PY
-}
-
 check_fabric_mod_json_safe() {
   local jar="$1"
   jar_has "$jar" "fabric.mod.json" || return 1
