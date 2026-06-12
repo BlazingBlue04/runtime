@@ -106,11 +106,17 @@ rm -f ./serversetup ./run.bat ./run.sh 2>/dev/null || true
 if [[ -f "./version.json" ]]; then
   _ftb_name="$(jq -r '(.name // .pack.name) // empty' version.json 2>/dev/null | tr -d '\r\n')" || _ftb_name=""
   _ftb_ver="$(jq -r '(.version // .pack.version) // empty' version.json 2>/dev/null | tr -d '\r\n')" || _ftb_ver=""
+  # Prefer the actual installed version id over a literal "latest"
+  _ftb_file_id="${VERSION_ID}"
+  if [[ "$_ftb_file_id" == "latest" || -z "$_ftb_file_id" ]]; then
+    _ftb_id_from_json="$(jq -r '(.id // .pack.versionId) // empty' version.json 2>/dev/null | tr -d '\r\n[:space:]')" || _ftb_id_from_json=""
+    [[ -n "$_ftb_id_from_json" ]] && _ftb_file_id="$_ftb_id_from_json"
+  fi
   _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown')"
   jq -n \
     --arg provider  "ftb" \
     --arg pack_id   "${PACK_ID}" \
-    --arg file_id   "${VERSION_ID}" \
+    --arg file_id   "${_ftb_file_id}" \
     --arg pack_name "$_ftb_name" \
     --arg pack_ver  "$_ftb_ver" \
     --arg updated   "$_ts" \
