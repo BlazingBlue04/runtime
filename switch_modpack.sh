@@ -107,6 +107,27 @@ debug(){ if [[ "$DEBUG" == "1" || "$DEBUG" == "true" ]]; then echo "[switch][deb
 
 has_glob() { compgen -G "$1" >/dev/null 2>&1; }
 
+# -----------------------------
+# Corruption/truncation check for jar-based artifacts.
+# A jar can exist (pass -f) but still be a partial/corrupt download from a
+# network blip mid-install. This adds a minimum-size floor so a truncated
+# jar is treated the same as a missing one and triggers reinstall.
+# -----------------------------
+jar_ok() {
+  local f="$1" minsize="${2:-10000}"
+  [[ -f "$f" ]] || return 1
+  local size
+  size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  [[ "$size" -ge "$minsize" ]]
+}
+
+glob_jar_ok() {
+  local pattern="$1" minsize="${2:-10000}"
+  local f
+  f="$(ls -1 $pattern 2>/dev/null | head -n1)"
+  [[ -n "$f" ]] && jar_ok "$f" "$minsize"
+}
+
 
 # -----------------------------
 # Memory detection (Pterodactyl-friendly)
@@ -515,13 +536,13 @@ if [[ -x "./startserver.sh" || -f "./startserver.sh" ]]; then has_any_start_arti
 if [[ -x "./LaunchServer.sh" || -f "./LaunchServer.sh" ]]; then has_any_start_artifact=1; fi
 if [[ -x "./ServerStart.sh" || -f "./ServerStart.sh" ]]; then has_any_start_artifact=1; fi
 if [[ -x "./StartServer.sh" || -f "./StartServer.sh" ]]; then has_any_start_artifact=1; fi
-if [[ -f "./server.jar" || -f "./minecraft_server.jar" ]]; then has_any_start_artifact=1; fi
-if [[ -f "./start-server.jar" ]]; then has_any_start_artifact=1; fi          # FTB installs rename forge-*.jar to this
+if jar_ok "./server.jar" || jar_ok "./minecraft_server.jar"; then has_any_start_artifact=1; fi
+if jar_ok "./start-server.jar"; then has_any_start_artifact=1; fi          # FTB installs rename forge-*.jar to this
 if [[ -f "./unix_args.txt" || -L "./unix_args.txt" ]]; then has_any_start_artifact=1; fi  # FTB/modern Forge argfile symlink
-if has_glob "./minecraft_server.*.jar"; then has_any_start_artifact=1; fi
-if has_glob "./forge-*.jar"; then has_any_start_artifact=1; fi
-if has_glob "./fabric-server-launch*.jar"; then has_any_start_artifact=1; fi
-if has_glob "./quilt-server-launch*.jar"; then has_any_start_artifact=1; fi
+if glob_jar_ok "./minecraft_server.*.jar"; then has_any_start_artifact=1; fi
+if glob_jar_ok "./forge-*.jar"; then has_any_start_artifact=1; fi
+if glob_jar_ok "./fabric-server-launch*.jar" 1000; then has_any_start_artifact=1; fi
+if glob_jar_ok "./quilt-server-launch*.jar" 1000; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then has_any_start_artifact=1; fi
