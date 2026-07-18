@@ -55,6 +55,32 @@ json_get() {
   jq -r "$expr"
 }
 
+# -----------------------------
+# cf_resolve_latest_file_id — resolve the TRUE latest CurseForge file by fileDate.
+#
+# IMPORTANT: mainFileId (from /v1/mods/{id}) is NOT necessarily the most recently
+# uploaded file — it's whatever the pack author has manually marked as the
+# "default"/"main" download on the CurseForge page, which can silently lag behind
+# newer uploads (sometimes indefinitely, if the author never updates it). Instead,
+# we pull the actual files list and pick the entry with the newest fileDate, which
+# reflects what was really uploaded most recently regardless of that setting.
+# -----------------------------
+cf_resolve_latest_file_id() {
+  local pack_id="$1"
+  local all_files="[]" idx=0 page_size=50 page_data count
+  while :; do
+    page_data="$(wget -qO- --header="Accept: application/json" --header="x-api-key: ${API_KEY}" \
+      "${CF_API}/v1/mods/${pack_id}/files?pageSize=${page_size}&index=${idx}" 2>/dev/null \
+      | jq -c '.data // []' 2>/dev/null)"
+    [[ -z "$page_data" || "$page_data" == "null" ]] && page_data="[]"
+    all_files="$(jq -c -n --argjson a "$all_files" --argjson b "$page_data" '$a + $b' 2>/dev/null)" || all_files="[]"
+    count="$(echo "$page_data" | jq 'length' 2>/dev/null || echo 0)"
+    idx=$((idx + page_size))
+    [[ "$count" -lt "$page_size" || "$idx" -ge 200 ]] && break
+  done
+  echo "$all_files" | jq -r '[.[] | select(.isAvailable == true)] | sort_by(.fileDate) | last | .id // empty' 2>/dev/null
+}
+
 echo "[curseforge] Retrieving project info for ${PACK_ID}..."
 MOD_JSON="$(req_json "/v1/mods/${PACK_ID}")"
 
@@ -67,13 +93,21 @@ if echo "$MOD_JSON" | jq -e '.data == null or .data.id == null' >/dev/null 2>&1;
 fi
 
 MOD_NAME="$(echo "$MOD_JSON" | json_get '.data.name // empty')"
-MAIN_FILE_ID="$(echo "$MOD_JSON" | json_get '.data.mainFileId // empty')"
 echo "[curseforge] Found pack: ${MOD_NAME} (id=${PACK_ID})"
 
 if [[ "${VERSION_ID}" == "latest" || -z "${VERSION_ID}" ]]; then
-  [[ -n "${MAIN_FILE_ID}" && "${MAIN_FILE_ID}" != "0" && "${MAIN_FILE_ID}" != "null" ]] || die "Pack does not expose a mainFileId; choose a specific file/version."
-  VERSION_ID="${MAIN_FILE_ID}"
-  echo "[curseforge] VERSION_ID=latest -> using mainFileId ${VERSION_ID}"
+  echo "[curseforge] VERSION_ID=latest -> querying file list for the most recently uploaded file..."
+  LATEST_FILE_ID="$(cf_resolve_latest_file_id "${PACK_ID}")"
+  if [[ -z "${LATEST_FILE_ID}" || "${LATEST_FILE_ID}" == "null" ]]; then
+    # Fall back to mainFileId only if the files list lookup failed entirely
+    MAIN_FILE_ID="$(echo "$MOD_JSON" | json_get '.data.mainFileId // empty')"
+    [[ -n "${MAIN_FILE_ID}" && "${MAIN_FILE_ID}" != "0" && "${MAIN_FILE_ID}" != "null" ]] || die "Could not determine latest file (files list lookup failed and no mainFileId). Choose a specific file/version."
+    echo "[curseforge] WARN: Could not resolve latest by fileDate — falling back to mainFileId ${MAIN_FILE_ID}."
+    VERSION_ID="${MAIN_FILE_ID}"
+  else
+    VERSION_ID="${LATEST_FILE_ID}"
+  fi
+  echo "[curseforge] VERSION_ID=latest -> resolved to most recently uploaded file ${VERSION_ID}"
 fi
 
 # Store resolved file ID so switch_modpack.sh can use it in the lock key
