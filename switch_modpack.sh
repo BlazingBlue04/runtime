@@ -569,7 +569,7 @@ deep_wipe() {
   local _level_name="world"
   if [[ -f "./server.properties" ]]; then
     local _ln
-    _ln="$(grep -E '^level-name\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')"
+    _ln="$(grep -E '^level-name\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')" || true
     [[ -n "${_ln:-}" ]] && _level_name="$_ln"
   fi
 
