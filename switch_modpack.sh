@@ -2011,7 +2011,7 @@ if [[ "${WIPE_WORLD:-0}" == "1" || "${WIPE_WORLD:-0}" == "true" ]]; then
   log "WIPE_WORLD=1 — deleting world folder(s)..."
   LEVEL_NAME="world"
   if [[ -f "./server.properties" ]]; then
-    _ln="$(grep -E '^level-name\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')"
+    _ln="$(grep -E '^level-name\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')" || true
     [[ -n "${_ln:-}" ]] && LEVEL_NAME="$_ln"
   fi
   for _wdir in "$LEVEL_NAME" "${LEVEL_NAME}_nether" "${LEVEL_NAME}_the_end" "world" "world_nether" "world_the_end"; do
@@ -2045,7 +2045,7 @@ patch_server_port() {
 
   if [[ -f "./server.properties" ]]; then
     local current_port
-    current_port="$(grep -E '^server-port\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')"
+    current_port="$(grep -E '^server-port\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')" || true
     if [[ "$current_port" == "$port" ]]; then
       log "server.properties: server-port already set to ${port} — no change needed."
     elif [[ -n "$current_port" ]]; then
