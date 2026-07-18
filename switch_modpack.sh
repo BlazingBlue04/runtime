@@ -351,12 +351,43 @@ if [[ -z "${CF_PROJECT_ID}" && "$current_key" =~ ^curseforge::([0-9]+):: ]]; the
   debug "CF_PROJECT_ID inferred from lock: $CF_PROJECT_ID"
 fi
 
+# -----------------------------
+# cf_resolve_latest_file_id — resolve the TRUE latest CurseForge file by fileDate.
+#
+# IMPORTANT: mainFileId (from /v1/mods/{id}) is NOT necessarily the most recently
+# uploaded file — it's whatever the pack author has manually marked as the
+# "default"/"main" download on the CurseForge page, which can silently lag behind
+# newer uploads (sometimes indefinitely, if the author never updates it). Using
+# mainFileId as "latest" causes servers to get stuck on an old version even after
+# a newer one is released. Instead, we pull the actual files list and pick the
+# entry with the newest fileDate, which reflects what was really uploaded most
+# recently regardless of the author's "default file" setting.
+# -----------------------------
+cf_resolve_latest_file_id() {
+  local pack_id="$1"
+  local all_files="[]" idx=0 page_size=50 page_data count
+  while :; do
+    page_data="$(curl -fsSL --retry 2 --max-time 10 \
+      -H "Accept: application/json" \
+      -H "x-api-key: ${CF_API_KEY}" \
+      "https://api.curseforge.com/v1/mods/${pack_id}/files?pageSize=${page_size}&index=${idx}" 2>/dev/null \
+      | jq -c '.data // []' 2>/dev/null)"
+    [[ -z "$page_data" || "$page_data" == "null" ]] && page_data="[]"
+    all_files="$(jq -c -n --argjson a "$all_files" --argjson b "$page_data" '$a + $b' 2>/dev/null)" || all_files="[]"
+    count="$(echo "$page_data" | jq 'length' 2>/dev/null || echo 0)"
+    idx=$((idx + page_size))
+    [[ "$count" -lt "$page_size" || "$idx" -ge 200 ]] && break
+  done
+  echo "$all_files" | jq -r '[.[] | select(.isAvailable == true)] | sort_by(.fileDate) | last | .id // empty' 2>/dev/null
+}
+
 # Desired key (include MC_VERSION for vanilla/paper so version changes trigger reinstall)
 # For CurseForge, resolve "latest" to the actual file ID so restarts don't re-download
 # when the pack hasn't changed. The resolved ID gets stored in .bb_resolved_file_id.
 #
-# When VERSION_ID=latest we also check the live CF API to see if mainFileId has changed
-# since the last install. If it has, we clear the stored ID so a reinstall is triggered.
+# When VERSION_ID=latest we also check the live CF API to see if the true latest
+# file (by fileDate) has changed since the last install. If it has, we clear the
+# stored ID so a reinstall is triggered.
 RESOLVED_VERSION_ID="${VERSION_ID_NORM:-latest}"
 if [[ "${PROVIDER:-}" == "curseforge" && "${VERSION_ID_NORM:-latest}" == "latest" && -n "${PACK_ID_NORM:-}" ]]; then
   _stored_resolved=""
@@ -369,11 +400,7 @@ if [[ "${PROVIDER:-}" == "curseforge" && "${VERSION_ID_NORM:-latest}" == "latest
     # Skip the live check if CF_API_KEY isn't set (e.g. non-CF configs).
     if [[ -n "${CF_API_KEY:-}" ]]; then
       log "VERSION_ID=latest: checking CurseForge for updates to pack ${PACK_ID_NORM}..."
-      _live_main_file_id="$(curl -fsSL --retry 2 --max-time 10 \
-        -H "Accept: application/json" \
-        -H "x-api-key: ${CF_API_KEY}" \
-        "https://api.curseforge.com/v1/mods/${PACK_ID_NORM}" 2>/dev/null \
-        | jq -r '.data.mainFileId // empty' 2>/dev/null | tr -d '[:space:]' || true)"
+      _live_main_file_id="$(cf_resolve_latest_file_id "${PACK_ID_NORM}" | tr -d '[:space:]')"
 
       if [[ -n "$_live_main_file_id" && "$_live_main_file_id" != "null" ]]; then
         if [[ "$_live_main_file_id" != "$_stored_resolved" ]]; then
@@ -480,12 +507,8 @@ case "${PROVIDER:-unknown}" in
     # Without this, desired_key="curseforge::ID::latest" never matches the lock file
     # which has the real ID, causing a reinstall on every single boot.
     if [[ "${RESOLVED_VERSION_ID}" == "latest" && -n "${PACK_ID_NORM:-}" && -n "${CF_API_KEY:-}" ]]; then
-      log "RESOLVED_VERSION_ID=latest and no stored ID — resolving mainFileId from CurseForge API..."
-      _cf_main="$(curl -fsSL --retry 2 --max-time 10 \
-        -H "Accept: application/json" \
-        -H "x-api-key: ${CF_API_KEY}" \
-        "https://api.curseforge.com/v1/mods/${PACK_ID_NORM}" 2>/dev/null \
-        | jq -r '.data.mainFileId // empty' 2>/dev/null | tr -d '[:space:]' || true)"
+      log "RESOLVED_VERSION_ID=latest and no stored ID — resolving true latest file (by fileDate) from CurseForge API..."
+      _cf_main="$(cf_resolve_latest_file_id "${PACK_ID_NORM}" | tr -d '[:space:]')"
       if [[ -n "$_cf_main" && "$_cf_main" != "null" && "$_cf_main" != "0" ]]; then
         RESOLVED_VERSION_ID="$_cf_main"
         # Persist so the next boot uses the stored-ID fast path instead of re-resolving
