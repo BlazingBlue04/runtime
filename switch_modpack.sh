@@ -537,6 +537,36 @@ case "${PROVIDER:-unknown}" in
     ;;
 esac
 
+# ---------------------------------------
+# Auto-wipe detection: switching to a genuinely different modpack (different
+# provider or different project/pack ID) should wipe the world, since an old
+# world's saved dimension/chunk data can reference mods that no longer exist
+# under the new pack, crashing the server on boot. Just updating the VERSION
+# of the same modpack should NOT wipe — that's a normal update and the world
+# should carry over. Every lock key is "provider::identity::version", so
+# comparing provider+identity (ignoring the version segment) distinguishes
+# the two cases cleanly.
+# ---------------------------------------
+pack_identity() {
+  local key="$1"
+  if [[ "$key" =~ ^([^:]+)::([^:]*)::(.*)$ ]]; then
+    echo "${BASH_REMATCH[1]}::${BASH_REMATCH[2]}"
+  else
+    echo "$key"
+  fi
+}
+AUTO_WIPE_WORLD_ON_SWITCH=0
+if [[ "$current_key" != "<none>" ]]; then
+  _current_identity="$(pack_identity "$current_key")"
+  _desired_identity="$(pack_identity "$desired_key")"
+  if [[ "$_current_identity" != "$_desired_identity" ]]; then
+    log "Modpack changed (${_current_identity} -> ${_desired_identity}) — different pack, not just a version update."
+    log "World will be auto-wiped so the new pack can generate a compatible one."
+    AUTO_WIPE_WORLD_ON_SWITCH=1
+  fi
+fi
+unset _current_identity _desired_identity
+
 log "Current key: $current_key"
 log "Desired key: $desired_key"
 
@@ -2030,8 +2060,12 @@ write_pack_info
 # ---------------------------------------
 # WIPE_WORLD — delete world folder(s) then warn user to reset it
 # ---------------------------------------
-if [[ "${WIPE_WORLD:-0}" == "1" || "${WIPE_WORLD:-0}" == "true" ]]; then
-  log "WIPE_WORLD=1 — deleting world folder(s)..."
+if [[ "${WIPE_WORLD:-0}" == "1" || "${WIPE_WORLD:-0}" == "true" || "${AUTO_WIPE_WORLD_ON_SWITCH:-0}" == "1" ]]; then
+  if [[ "${AUTO_WIPE_WORLD_ON_SWITCH:-0}" == "1" ]]; then
+    log "Auto-wipe (modpack switch) — deleting world folder(s)..."
+  else
+    log "WIPE_WORLD=1 — deleting world folder(s)..."
+  fi
   LEVEL_NAME="world"
   if [[ -f "./server.properties" ]]; then
     _ln="$(grep -E '^level-name\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')" || true
@@ -2044,7 +2078,9 @@ if [[ "${WIPE_WORLD:-0}" == "1" || "${WIPE_WORLD:-0}" == "true" ]]; then
     fi
   done
   log "World wipe complete. A new world will generate on next startup."
-  log "⚠ Set WIPE_WORLD back to 0 in startup variables to avoid wiping again on the next restart."
+  if [[ "${AUTO_WIPE_WORLD_ON_SWITCH:-0}" != "1" ]]; then
+    log "⚠ Set WIPE_WORLD back to 0 in startup variables to avoid wiping again on the next restart."
+  fi
 fi
 # ---------------------------------------
 # server-port patch — writes SERVER_PORT into server.properties every boot.
