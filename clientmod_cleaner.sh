@@ -186,7 +186,7 @@ CLIENT_ONLY_PATTERNS=(
   "oculus*"           "embeddium*"        "rubidium*"
   "iris*"             "optifine*"         "optifabric*"
   "EuphoriaPatcher*"  "euphoria_patcher*" "gpumemleakfix*"
-  "fancymenu*"        "legendarytooltips*" "itemphysiclite*"
+  "legendarytooltips*" "itemphysiclite*"
   "lootbeams*"        "toastcontrol*"      "ToastControl*"
   "light-overlay*"    "lightoverlay*"      "BetterAdvancements*"
   "Xaeros_Minimap*"   "XaerosWorldMap*"
