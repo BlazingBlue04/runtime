@@ -292,8 +292,17 @@ fabric_install() {
   export JAVA_HOME="$(dirname "$(dirname "$java")")"
 
   # Fabric installer: https://maven.fabricmc.net/net/fabricmc/fabric-installer/
-  # Pin to a known-good recent installer if not provided.
-  local inst_ver="${FABRIC_INSTALLER_VERSION:-1.0.1}"
+  # Resolve "latest" (or an unset/empty value) via the real maven-metadata.xml —
+  # Fabric's maven does NOT support "latest" as a literal path segment, so
+  # building the URL with that string produces a 404-style download failure.
+  local inst_ver="${FABRIC_INSTALLER_VERSION:-latest}"
+  if [[ -z "$inst_ver" || "$inst_ver" == "latest" ]]; then
+    inst_ver="$(curl -fsSL --retry 3 --max-time 15 \
+      https://maven.fabricmc.net/net/fabricmc/fabric-installer/maven-metadata.xml 2>/dev/null \
+      | grep -oP '(?<=<release>)[^<]+' | head -1 || true)"
+    inst_ver="${inst_ver:-1.0.1}"
+    echo "[curseforge] Resolved Fabric installer version: ${inst_ver}"
+  fi
   local url="https://maven.fabricmc.net/net/fabricmc/fabric-installer/${inst_ver}/fabric-installer-${inst_ver}.jar"
   echo "[curseforge] Installing Fabric server: mc=${mc} loader=${loader_ver} installer=${inst_ver}"
   rm -f fabric-installer.jar
