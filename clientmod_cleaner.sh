@@ -193,6 +193,18 @@ CLIENT_ONLY_PATTERNS=(
   "CosmeticArmorReworked*" "cosmeticarmorreworked*"
   "skinlayers*"       "3dskinlayers*"      "entityculling*"
   "not-enough-animations*" "visuality*"
+  # --- Confirmed-crashing dist-cleaner/shader-adjacent mods (found the hard
+  # way troubleshooting a real pack: unconditional client-class references in
+  # their mixins crash a dedicated server outright, not just missing metadata) ---
+  "mekalus*"                              # Oculus (Iris port) — client-only shaders
+  "colorwheel*"                           # requires Iris; colorwheel_patcher* covered by this glob too
+  "entity_texture_features*"              # ETF — client-only texture variants
+  "nolijium*"                             # client-only rendering optimization
+  "Brute*Force*Culling*"                  # client-only leaf/foliage culling
+  "Brute%20Force%20Culling*"              # same mod, pre-fix encoded filename still on disk on old installs
+  "sodiumextras*"                         # client-only Sodium UI extras
+  "*RevelationFix*"                       # client-only rendering fix, ships as "[Forge]RevelationFix-*"
+  "gtbcs_geomancy_plus*"                  # client-rendering addon for GTBC's Geomancy
 )
 
 matches_pattern() {
