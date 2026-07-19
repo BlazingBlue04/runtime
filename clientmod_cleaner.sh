@@ -311,8 +311,22 @@ for jar in "$MODS_DIR"/*.jar; do
     continue
   fi
 
-  # Step 1: Try metadata detection
-  env_result="$(detect_mod_environment "$jar" 2>/dev/null)" || env_result="unknown"
+  # Step 1: Metadata detection — DISABLED BY DEFAULT.
+  #
+  # Real-world experience across multiple packs showed this fails in BOTH
+  # directions: it wrongly trusts mods whose mods.toml claims server-safety
+  # but actually crash the server (RevelationFix), AND it wrongly flags
+  # genuinely universal mods as client-only based on incomplete/ambiguous
+  # metadata (AppleSkin, BadOptimizations — both got disabled here despite
+  # being required server-side). A mod author's self-declared metadata isn't
+  # reliable enough to act on automatically. Set BB_TRUST_METADATA=1 to
+  # re-enable this step if you want it back for a specific pack, but the
+  # explicit pattern lists below are the trustworthy mechanism going forward.
+  if [[ "${BB_TRUST_METADATA:-0}" == "1" ]]; then
+    env_result="$(detect_mod_environment "$jar" 2>/dev/null)" || env_result="unknown"
+  else
+    env_result="unknown"
+  fi
 
   if [[ "$env_result" == "client" ]]; then
     reason="metadata"
