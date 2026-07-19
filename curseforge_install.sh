@@ -394,6 +394,15 @@ download_mods_from_manifest_if_needed() {
 
     local fname
     fname="$(basename "${url%%\?*}")"
+    # CurseForge download URLs are percent-encoded (spaces -> %20, brackets ->
+    # %5b/%5d, apostrophes -> %27, etc). basename pulls the raw encoded string
+    # straight out of the URL path, so without decoding it here, mods with any
+    # of those characters in their real filename get saved to disk with the
+    # literal escape codes still in the name (e.g. "Brute%20Force%20Culling...")
+    # instead of the actual filename Forge/FML reports in crash logs and mod
+    # lists ("Brute Force Culling..."). That mismatch makes every later lookup
+    # by the "real" name silently fail to find the file.
+    fname="$(printf '%b' "${fname//%/\\x}")"
     # Avoid re-download if already present
     if [[ -f "./mods/${fname}" ]]; then
       ok=$((ok+1))
