@@ -2139,10 +2139,16 @@ else
 fi
 
 # ---------------------------------------
-# Client mod cleaner (optional, toggle via CLEAN_CLIENT_MODS env var)
-# Set CLEAN_CLIENT_MODS=true in Pterodactyl startup variables to enable.
+# Client mod cleaner — ON BY DEFAULT.
+# Set CLEAN_CLIENT_MODS=false in Pterodactyl startup variables to disable.
+#
+# Previously opt-in (default false), which meant a fresh install of any pack
+# got zero protection from client-only mods that crash a dedicated server
+# unless someone remembered to manually flip this on per-server. Given the
+# whole point of this script is fresh installs working without manual
+# intervention, it now defaults to on.
 # ---------------------------------------
-if [[ "${CLEAN_CLIENT_MODS:-false}" == "true" || "${CLEAN_CLIENT_MODS:-false}" == "1" ]]; then
+if [[ "${CLEAN_CLIENT_MODS:-true}" == "true" || "${CLEAN_CLIENT_MODS:-true}" == "1" ]]; then
   case "${PROVIDER:-}" in
     vanilla|paper|bedrock)
       log "CLEAN_CLIENT_MODS=true but provider=${PROVIDER} has no mods — skipping client mod cleaner."
