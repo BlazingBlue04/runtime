@@ -193,9 +193,20 @@ CLIENT_ONLY_PATTERNS=(
   "CosmeticArmorReworked*" "cosmeticarmorreworked*"
   "skinlayers*"       "3dskinlayers*"      "entityculling*"
   "not-enough-animations*" "visuality*"
-  # --- Confirmed-crashing dist-cleaner/shader-adjacent mods (found the hard
-  # way troubleshooting a real pack: unconditional client-class references in
-  # their mixins crash a dedicated server outright, not just missing metadata) ---
+)
+
+# =============================================================================
+# FORCE-DISABLE LIST — overrides metadata entirely
+#
+# These are mods we've EMPIRICALLY confirmed crash a dedicated server with
+# "invalid dist DEDICATED_SERVER" or MixinTransformerError, found the hard way
+# by troubleshooting real crash logs. Their own mods.toml either declares
+# side=BOTH incorrectly or doesn't specify a side at all (defaulting to
+# server-compatible), so the normal metadata-first detection trusts their
+# (wrong) self-declaration and never reaches the filename-pattern fallback.
+# This list is checked BEFORE metadata, specifically to override that.
+# =============================================================================
+FORCE_DISABLE_PATTERNS=(
   "mekalus*"                              # Oculus (Iris port) — client-only shaders
   "colorwheel*"                           # requires Iris; colorwheel_patcher* covered by this glob too
   "entity_texture_features*"              # ETF — client-only texture variants
@@ -210,6 +221,16 @@ CLIENT_ONLY_PATTERNS=(
 matches_pattern() {
   local name_lower="${1,,}"
   for pattern in "${CLIENT_ONLY_PATTERNS[@]}"; do
+    case "$name_lower" in
+      ${pattern,,}) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+matches_force_pattern() {
+  local name_lower="${1,,}"
+  for pattern in "${FORCE_DISABLE_PATTERNS[@]}"; do
     case "$name_lower" in
       ${pattern,,}) return 0 ;;
     esac
@@ -271,6 +292,24 @@ server_safe=0
 for jar in "$MODS_DIR"/*.jar; do
   [[ -f "$jar" ]] || continue
   name="$(basename "$jar")"
+
+  # Step 0: force-disable overrides metadata entirely. These mods are
+  # empirically confirmed to crash a dedicated server regardless of what
+  # their own mods.toml claims about side compatibility — checking this
+  # first prevents a wrong self-declared "both"/"server" from ever letting
+  # them slip past.
+  if matches_force_pattern "$name"; then
+    reason="known crash-causing mod (forced, overrides metadata)"
+    if "$DRY_RUN"; then
+      echo "[cleaner]   [would disable] $name  ($reason)"
+    else
+      mv "$jar" "$DISABLED_DIR/$name"
+      echo "[cleaner]   [disabled] $name  ($reason)" | tee -a "$LOG_FILE"
+    fi
+    ((moved++)) || true
+    ((pattern_removed++)) || true
+    continue
+  fi
 
   # Step 1: Try metadata detection
   env_result="$(detect_mod_environment "$jar" 2>/dev/null)" || env_result="unknown"
