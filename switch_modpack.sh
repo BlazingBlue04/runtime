@@ -1935,6 +1935,22 @@ start_server() {
 }
 
 # ---------------------------------------
+# MANUALLY_MANAGED — permanent opt-out for servers with a hand-placed pack
+# (e.g. an official server pack extracted directly, not installed through
+# curseforge_install.sh). Set MANUALLY_MANAGED=true in Pterodactyl startup
+# variables to guarantee deep_wipe/run_installer NEVER run on this server,
+# no matter what happens to VERSION_ID, CF_API_KEY, or .modpack.lock later.
+# Everything else (self-update, client mod cleaner, JVM args, server start)
+# still runs normally — this only disables the install/reinstall path.
+# ---------------------------------------
+if [[ "${MANUALLY_MANAGED:-false}" == "true" || "${MANUALLY_MANAGED:-false}" == "1" ]]; then
+  if [[ "$need_reinstall" -eq 1 ]]; then
+    log "MANUALLY_MANAGED=true — a reinstall would normally trigger here, but it's being SKIPPED because this server's mods/config are managed by hand. If you actually want to change the modpack, either unset MANUALLY_MANAGED first, or update the files manually yourself."
+  fi
+  need_reinstall=0
+fi
+
+# ---------------------------------------
 # Main flow
 # ---------------------------------------
 if [[ "$need_reinstall" -eq 1 ]]; then
