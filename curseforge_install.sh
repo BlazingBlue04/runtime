@@ -357,6 +357,7 @@ download_mods_from_manifest_if_needed() {
 
   local i=0
   local skipped_mods=()
+  local retry_mods=()
   while read -r pid fid; do
     [[ -n "${pid:-}" && -n "${fid:-}" ]] || continue
     i=$((i+1))
@@ -406,14 +407,17 @@ download_mods_from_manifest_if_needed() {
     if [[ "$http_code" =~ ^2[0-9][0-9]$ && -f "./mods/${fname}" && -s "./mods/${fname}" ]]; then
       ok=$((ok+1))
     elif [[ "$http_code" == "403" ]]; then
-      # Mod author has disabled CDN distribution; note it and continue
+      # Mod author has disabled CDN distribution; permanent, no point retrying.
       echo "[curseforge] manifest: (${i}/${total}) ${fname} -> SKIPPED (403 forbidden; mod blocks redistribution)"
       skipped_mods+=("${fname}  ->  https://www.curseforge.com/minecraft/mc-mods/${pid}/files/${fid}")
       rm -f "./mods/${fname}" 2>/dev/null || true
       fail=$((fail+1))
     else
-      echo "[curseforge] manifest: (${i}/${total}) ${fname} -> FAILED (http ${http_code})"
+      # Likely transient (rate limiting / network blip mid-batch) — queue for a
+      # single retry pass after the main loop finishes, once the burst has settled.
+      echo "[curseforge] manifest: (${i}/${total}) ${fname} -> FAILED (http ${http_code}), will retry"
       rm -f "./mods/${fname}" 2>/dev/null || true
+      retry_mods+=("${fname}|${url}|${pid}|${fid}")
       fail=$((fail+1))
     fi
 
@@ -423,17 +427,64 @@ download_mods_from_manifest_if_needed() {
     fi
   done < .bb_manifest_mods.txt
 
+  echo "[curseforge] manifest: first pass complete (ok=${ok} fail=${fail})"
+
+  # ---------------------------------------
+  # Retry pass — one more attempt at every transient (non-403) failure, after a
+  # short pause. Catches the common case of CurseForge/ForgeCDN briefly rate
+  # limiting mid-batch on a large modpack; most of these succeed on retry once
+  # the burst of ~400+ rapid requests has settled.
+  # ---------------------------------------
+  local failed_mods=()
+  if [[ ${#retry_mods[@]} -gt 0 ]]; then
+    echo ""
+    echo "[curseforge] Retrying ${#retry_mods[@]} mod(s) that failed on first pass..."
+    sleep 5
+    local r=0
+    for entry in "${retry_mods[@]}"; do
+      r=$((r+1))
+      local rfname rurl rpid rfid
+      IFS='|' read -r rfname rurl rpid rfid <<< "$entry"
+      local rcode
+      rcode="$(curl -sL --retry 3 --retry-delay 2 -A "Mozilla/5.0" \
+        -w "%{http_code}" -o "./mods/${rfname}" "$rurl" 2>/dev/null)" || rcode="${rcode:-000}"
+      if [[ "$rcode" =~ ^2[0-9][0-9]$ && -f "./mods/${rfname}" && -s "./mods/${rfname}" ]]; then
+        echo "[curseforge] retry (${r}/${#retry_mods[@]}) ${rfname} -> OK"
+        ok=$((ok+1))
+        fail=$((fail-1))
+      else
+        echo "[curseforge] retry (${r}/${#retry_mods[@]}) ${rfname} -> STILL FAILED (http ${rcode})"
+        rm -f "./mods/${rfname}" 2>/dev/null || true
+        failed_mods+=("${rfname}  ->  https://www.curseforge.com/minecraft/mc-mods/${rpid}/files/${rfid}")
+      fi
+    done
+  fi
+
   echo "[curseforge] manifest: complete (ok=${ok} fail=${fail})"
 
-  # Print a clear summary of skipped mods so server admins can add them manually
+  # Print a clear summary of EVERY mod that didn't make it in, so admins have
+  # full visibility instead of only seeing the permanent (403) failures.
   if [[ ${#skipped_mods[@]} -gt 0 ]]; then
     echo ""
     echo "[curseforge] ============================================================"
-    echo "[curseforge] MANUAL ACTION REQUIRED: ${#skipped_mods[@]} mod(s) could not"
-    echo "[curseforge] be downloaded automatically (blocked redistribution / 403)."
+    echo "[curseforge] MANUAL ACTION REQUIRED: ${#skipped_mods[@]} mod(s) blocked"
+    echo "[curseforge] third-party redistribution (403) — CANNOT be auto-downloaded."
     echo "[curseforge] Add these mods manually to the /mods folder:"
     echo "[curseforge] ------------------------------------------------------------"
     for entry in "${skipped_mods[@]}"; do
+      echo "[curseforge]   $entry"
+    done
+    echo "[curseforge] ============================================================"
+    echo ""
+  fi
+  if [[ ${#failed_mods[@]} -gt 0 ]]; then
+    echo ""
+    echo "[curseforge] ============================================================"
+    echo "[curseforge] ${#failed_mods[@]} mod(s) still failed after retry (network/CDN"
+    echo "[curseforge] issue, not a redistribution block). Re-running the install"
+    echo "[curseforge] often resolves these. If it keeps happening, add manually:"
+    echo "[curseforge] ------------------------------------------------------------"
+    for entry in "${failed_mods[@]}"; do
       echo "[curseforge]   $entry"
     done
     echo "[curseforge] ============================================================"
