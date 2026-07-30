@@ -68,7 +68,7 @@ force_java_override() {
   local maj="${JAVA_MAJOR:-}"
   if [[ -z "$maj" || "$maj" == "none" || "$maj" == "auto" ]]; then return 0; fi
   case "$maj" in
-    8|11|17|21)
+    8|11|17|21,25)
       if [[ -x "/opt/java/${maj}/bin/java" ]]; then
         export JAVA="/opt/java/${maj}/bin/java"
         export JAVA_HOME="/opt/java/${maj}"
@@ -1046,6 +1046,11 @@ detect_mc_version() {
       | xargs -I{} basename {} 2>/dev/null \
       | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | sort | uniq -c | sort -rn | head -n1 | awk '{print $2}' || true)"
   fi
+  
+  # Paper jar name: paper-26.2-84.jar
+  if [[ -z "$v" ]] && has_glob "./paper-*.jar"; then
+    v="$(ls -1 ./paper-*.jar 2>/dev/null | head -n1 | sed -E 's#^(./)?paper-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\2#')"
+  fi
 
   v="$(strip_mc "${v:-}")"
   echo "${v:-<unknown>}"
@@ -1086,32 +1091,23 @@ detect_loader() {
 java_for() {
   local mc="$1"
   local loader="$2"
-
-  # NeoForge always requires Java 21
   if [[ "$loader" == "neoforge" ]]; then
     echo "/opt/java/21/bin/java"; return
   fi
-
-  # Unknown MC version — default to 21 (modern default)
   if [[ "$mc" == "<unknown>" ]]; then
-    echo "/opt/java/21/bin/java"; return
+    echo "/opt/java/25/bin/java"; return
   fi
-
-  # Parse minor version
   if [[ "$mc" =~ ^1\.([0-9]+) ]]; then
     local minor="${BASH_REMATCH[1]}"
-
-    # 1.0 – 1.16: Java 8
     if (( minor <= 16 )); then echo "/opt/java/8/bin/java"; return; fi
-
-    # 1.17 – 1.20: Java 17
     if (( minor <= 20 )); then echo "/opt/java/17/bin/java"; return; fi
-
-    # 1.21+: Java 21
     echo "/opt/java/21/bin/java"; return
   fi
-
-  # Non-standard version string — default to 21
+  # Calendar-based major versions (26+) need newer Java
+  if [[ "$mc" =~ ^([0-9]+)\. ]]; then
+    local major="${BASH_REMATCH[1]}"
+    if (( major >= 26 )); then echo "/opt/java/25/bin/java"; return; fi
+  fi
   echo "/opt/java/21/bin/java"
 }
 
