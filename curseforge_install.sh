@@ -253,6 +253,9 @@ forge_install() {
     local minor="${BASH_REMATCH[1]}"
     if (( minor <= 16 )); then java_ver="8"; fi
     if (( minor >= 17 && minor <= 20 )); then java_ver="17"; fi
+  elif [[ "$mc" =~ ^([0-9]+)\. ]]; then
+    local major="${BASH_REMATCH[1]}"
+    if (( major >= 26 )); then java_ver="25"; fi
   fi
 
   # Try version-specific java first, then any java

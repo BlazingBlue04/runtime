@@ -68,7 +68,7 @@ force_java_override() {
   local maj="${JAVA_MAJOR:-}"
   if [[ -z "$maj" || "$maj" == "none" || "$maj" == "auto" ]]; then return 0; fi
   case "$maj" in
-    8|11|17|21,25)
+    8|11|17|21|25)
       if [[ -x "/opt/java/${maj}/bin/java" ]]; then
         export JAVA="/opt/java/${maj}/bin/java"
         export JAVA_HOME="/opt/java/${maj}"
@@ -1040,16 +1040,28 @@ detect_mc_version() {
     v="$(ls -1 ./minecraft_server.*.jar 2>/dev/null | head -n1 | sed -E 's#^(./)?minecraft_server\.([0-9]+\.[0-9]+(\.[0-9]+)?).*#\2#')"
   fi
 
+  # 6b. Paper jar name: paper-26.2-84.jar or paper-1.20.1-196.jar
+  #     (Paper's own naming has no "minecraft_server" prefix, so this was previously
+  #     falling through to <unknown> for pure Paper installs.)
+  if [[ -z "$v" ]] && has_glob "./paper-*.jar"; then
+    v="$(ls -1 ./paper-*.jar 2>/dev/null | head -n1 | sed -E 's#^(./)?paper-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\2#')"
+  fi
+
+  # 6c. Purpur jar name: purpur-1.20.1-2234.jar (Paper fork, same naming convention)
+  if [[ -z "$v" ]] && has_glob "./purpur-*.jar"; then
+    v="$(ls -1 ./purpur-*.jar 2>/dev/null | head -n1 | sed -E 's#^(./)?purpur-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\2#')"
+  fi
+
+  # 6d. Spigot/CraftBukkit jar name: spigot-1.20.1.jar / craftbukkit-1.20.1.jar
+  if [[ -z "$v" ]] && (has_glob "./spigot-*.jar" || has_glob "./craftbukkit-*.jar"); then
+    v="$(ls -1 ./spigot-*.jar ./craftbukkit-*.jar 2>/dev/null | head -n1 | sed -E 's#^(\./)?(spigot|craftbukkit)-([0-9]+\.[0-9]+(\.[0-9]+)?)\.jar#\3#')"
+  fi
+
   # 7. Infer from mod filenames in mods/
   if [[ -z "$v" && -d "./mods" ]]; then
     v="$(find ./mods -maxdepth 1 -type f -name '*.jar' 2>/dev/null \
       | xargs -I{} basename {} 2>/dev/null \
       | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | sort | uniq -c | sort -rn | head -n1 | awk '{print $2}' || true)"
-  fi
-  
-  # Paper jar name: paper-26.2-84.jar
-  if [[ -z "$v" ]] && has_glob "./paper-*.jar"; then
-    v="$(ls -1 ./paper-*.jar 2>/dev/null | head -n1 | sed -E 's#^(./)?paper-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*#\2#')"
   fi
 
   v="$(strip_mc "${v:-}")"
@@ -1091,23 +1103,42 @@ detect_loader() {
 java_for() {
   local mc="$1"
   local loader="$2"
+
+  # NeoForge always requires Java 21
   if [[ "$loader" == "neoforge" ]]; then
     echo "/opt/java/21/bin/java"; return
   fi
+
+  # Unknown MC version — default to 21 (modern default)
   if [[ "$mc" == "<unknown>" ]]; then
-    echo "/opt/java/25/bin/java"; return
-  fi
-  if [[ "$mc" =~ ^1\.([0-9]+) ]]; then
-    local minor="${BASH_REMATCH[1]}"
-    if (( minor <= 16 )); then echo "/opt/java/8/bin/java"; return; fi
-    if (( minor <= 20 )); then echo "/opt/java/17/bin/java"; return; fi
     echo "/opt/java/21/bin/java"; return
   fi
-  # Calendar-based major versions (26+) need newer Java
+
+  # Parse minor version (classic "1.x" scheme)
+  if [[ "$mc" =~ ^1\.([0-9]+) ]]; then
+    local minor="${BASH_REMATCH[1]}"
+
+    # 1.0 – 1.16: Java 8
+    if (( minor <= 16 )); then echo "/opt/java/8/bin/java"; return; fi
+
+    # 1.17 – 1.20: Java 17
+    if (( minor <= 20 )); then echo "/opt/java/17/bin/java"; return; fi
+
+    # 1.21+: Java 21
+    echo "/opt/java/21/bin/java"; return
+  fi
+
+  # Calendar-based major versions (Minecraft moved away from "1.x" starting
+  # with version 26 — e.g. "26.1", "26.2"). These require newer Java than
+  # the old 1.21 -> Java 21 mapping above.
   if [[ "$mc" =~ ^([0-9]+)\. ]]; then
     local major="${BASH_REMATCH[1]}"
     if (( major >= 26 )); then echo "/opt/java/25/bin/java"; return; fi
+    # Shouldn't normally hit this (no MC major between "1" and "26" exists),
+    # but fall through to the modern default just in case.
   fi
+
+  # Non-standard version string — default to 21
   echo "/opt/java/21/bin/java"
 }
 
