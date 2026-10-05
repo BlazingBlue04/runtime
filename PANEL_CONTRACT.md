@@ -215,7 +215,7 @@ export interface BBWorldArchive {
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RUNTIME_REF` | `v2.0.0` | git ref the runtime is pulled from |
+| `RUNTIME_REF` | `v2.0.1` | git ref the runtime is pulled from |
 | `BB_WORLD_ARCHIVE_KEEP` | 5 | archives kept per reason |
 | `BB_BACKUP_KEEP` | 2 | pre-update backups kept (0 = no backups) |
 | `BB_ALLOW_MISSING_MODS` | 0 | 1 = finish a CurseForge install even if some mods failed to download |

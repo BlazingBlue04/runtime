@@ -275,7 +275,12 @@ force_java_override
 # Self-update: re-download runtime scripts from GitHub on every boot
 # This ensures fixes pushed to GitHub are picked up automatically.
 # ---------------------------------------
-RUNTIME_RAW_BASE="${RUNTIME_RAW_BASE:-https://raw.githubusercontent.com/BlazingBlue04/runtime/main}"
+# RUNTIME_REF (egg variable) decides the ref even when the server's startup command
+# is an old one that never exported RUNTIME_RAW_BASE. Without this, such a server
+# "self-updates" from main and silently replaces the v2 runtime with v1.
+RUNTIME_RAW_BASE="${RUNTIME_RAW_BASE:-https://raw.githubusercontent.com/BlazingBlue04/runtime/${RUNTIME_REF:-main}}"
+export RUNTIME_RAW_BASE
+log "Runtime source: ${RUNTIME_RAW_BASE}"
 
 # Also self-update the installer scripts so fixes propagate to existing servers
 RUNTIME_SCRIPTS=(
@@ -839,6 +844,16 @@ detect_mc_version() {
     if [[ -n "$v" && "$v" != "null" && "$v" != "latest" ]]; then echo "$v"; return; fi
     v=""
   fi
+
+  # 0b. Ask the server jar itself. Vanilla and Paper jars (1.14+) carry a
+  #     version.json with the exact id. This covers servers installed by the v1
+  #     runtime, which have no .bb_install_meta.json.
+  local _j _jv
+  for _j in ./server.jar ./minecraft_server*.jar ./paper-*.jar; do
+    [[ -f "$_j" ]] || continue
+    _jv="$(unzip -p "$_j" version.json 2>/dev/null | jq -r '.id // empty' 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$_jv" =~ ^[0-9]+\.[0-9]+ ]]; then echo "$(strip_mc "$_jv")"; return; fi
+  done
 
   # 1. Read from .bb_pack_info.json (written after install — most reliable)
   if [[ -f ".bb_pack_info.json" ]]; then

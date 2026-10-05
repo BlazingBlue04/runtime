@@ -356,6 +356,19 @@ boot PACK_PROVIDER=bedrock
 check "restart is a plain boot"              jqt "$S/.bb_install_status.json" '.kind=="boot"'
 check "customer server.properties intact"    has "$S/server.properties" "Keanu Realm"
 
+t "23. Server installed by v1 (no install record): version read from the jar"
+new_server v1vanilla
+mkdir -p "$WORK/vj" && echo '{"id":"26.1","name":"26.1"}' > "$WORK/vj/version.json" && head -c 20000 /dev/zero > "$WORK/vj/pad"
+(cd "$WORK/vj" && zip -q0 "$S/server.jar" version.json pad)
+echo "vanilla::latest::latest" > "$S/.modpack.lock"
+boot PACK_PROVIDER=vanilla MC_VERSION=latest
+check "plain boot, no reinstall"             jqt "$S/.bb_install_status.json" '.kind=="boot"'
+check "MC version read from jar"             has "$LAST_LOG" "Detected MC version: 26.1"
+check "Java 25 selected for it"              bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 26.1) == 25 ]]"
+
+t "24. RUNTIME_REF picks the download source without the startup command's help"
+check "ref used when RUNTIME_RAW_BASE unset" bash -c "grep -q 'runtime/\${RUNTIME_REF:-main}}' '$ROOT/switch_modpack.sh'"
+
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
 check "1.18.2 -> 17"  bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.18.2) == 17 ]]"
