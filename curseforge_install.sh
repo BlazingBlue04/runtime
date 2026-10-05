@@ -13,6 +13,17 @@ die() { echo "[curseforge] ERROR: $*" >&2; exit 1; }
 
 need() { local v="${1}"; local name="${2}"; [[ -n "$v" ]] || die "Missing env var: $name"; }
 
+# Shared helpers (status file, loader installers). Optional so the script still
+# runs standalone for debugging, but the egg always ships it.
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_here}/bb_lib.sh" ]]; then
+  # shellcheck source=bb_lib.sh
+  source "${_here}/bb_lib.sh"
+else
+  bb_status() { :; }
+  bb_warn_status() { echo "[curseforge] WARN: $*" >&2; }
+fi
+
 CF_API="https://api.curseforge.com"
 API_KEY="${CF_API_KEY:-}"
 PACK_ID="${PACK_ID:-}"
@@ -81,6 +92,7 @@ cf_resolve_latest_file_id() {
   echo "$all_files" | jq -r '[.[] | select(.isAvailable == true)] | sort_by(.fileDate) | last | .id // empty' 2>/dev/null
 }
 
+bb_status installing "Looking up modpack on CurseForge"
 echo "[curseforge] Retrieving project info for ${PACK_ID}..."
 MOD_JSON="$(req_json "/v1/mods/${PACK_ID}")"
 
@@ -141,10 +153,12 @@ DL_URL="$(echo "$FILE_JSON" | json_get '.data.downloadUrl // empty')"
 
 echo "[curseforge] Getting download url for file '${VERSION_ID}'..."
 echo "[curseforge] Downloading server pack..."
+bb_status installing "Downloading ${MOD_NAME:-modpack}"
 rm -f serverpack.zip
 wget -qO serverpack.zip "$DL_URL" || die "Download failed for: $DL_URL"
 
 echo "[curseforge] Unpacking serverpack.zip..."
+bb_status installing "Unpacking ${MOD_NAME:-modpack}"
 rm -rf .bb_tmp_unpack
 mkdir -p .bb_tmp_unpack
 unzip -q serverpack.zip -d .bb_tmp_unpack || die "Failed to unzip serverpack.zip"
@@ -204,7 +218,7 @@ find_java() {
 have_runnable() {
   [[ -f "./run.sh" || -f "./start.sh" || -f "./LaunchServer.sh" ]] && return 0
   [[ -f "./ServerStart.sh" || -f "./StartServer.sh" || -f "./startserver.sh" ]] && return 0
-  [[ -f "./server.jar" ]] && return 0
+  [[ -f "./server.jar" || -f "./fabric-server-launch.jar" || -f "./quilt-server-launch.jar" ]] && return 0
   [[ -d "./libraries" ]] && return 0
   # Check for forge jars
   compgen -G "./forge-*.jar" >/dev/null 2>&1 && return 0
@@ -243,88 +257,17 @@ PY
 }
 
 
-forge_install() {
-  local mc="$1" forge_ver="$2"
-  local java
-
-  # Pick the right Java version for this MC version
-  local java_ver="21"
-  if [[ "$mc" =~ ^1\.([0-9]+) ]]; then
-    local minor="${BASH_REMATCH[1]}"
-    if (( minor <= 16 )); then java_ver="8"; fi
-    if (( minor >= 17 && minor <= 20 )); then java_ver="17"; fi
-  elif [[ "$mc" =~ ^([0-9]+)\. ]]; then
-    local major="${BASH_REMATCH[1]}"
-    if (( major >= 26 )); then java_ver="25"; fi
+# All loader installs go through bb_install_loader (bb_lib.sh), which handles
+# Forge, NeoForge (incl. 1.20.1's legacy coordinates), Fabric and Quilt properly
+# and picks the right Java for the Minecraft version.
+loader_install() {
+  local loader="$1" mc="$2" ver="$3"
+  if ! declare -F bb_install_loader >/dev/null; then
+    die "bb_lib.sh not available — cannot install ${loader}."
   fi
-
-  # Try version-specific java first, then any java
-  if [[ -x "/opt/java/${java_ver}/bin/java" ]]; then
-    java="/opt/java/${java_ver}/bin/java"
-  else
-    java="$(find_java)" || die "java not found in PATH/JAVA_HOME (required to install Forge)."
-  fi
-
-  export PATH="$(dirname "$java"):$PATH"
-  export JAVA_HOME="$(dirname "$(dirname "$java")")"
-
-  local url="https://maven.minecraftforge.net/net/minecraftforge/forge/${mc}-${forge_ver}/forge-${mc}-${forge_ver}-installer.jar"
-  echo "[curseforge] Installing Forge server: ${mc}-${forge_ver}"
-  rm -f forge-installer.jar
-  wget -qO forge-installer.jar "$url" || die "Failed to download Forge installer: $url"
-  "$java" -Djava.awt.headless=true -jar forge-installer.jar --installServer || die "Forge installer failed."
-  rm -f forge-installer.jar
-
-  # Make a simple start.sh so the egg can always start something deterministic.
-  if [[ -f "./run.sh" ]]; then
-    cat > ./start.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-chmod +x ./run.sh 2>/dev/null || true
-exec bash ./run.sh
-SH
-    chmod +x ./start.sh || true
-  fi
+  bb_status installing "Installing ${loader} ${ver} for Minecraft ${mc}"
+  bb_install_loader "$loader" "$mc" "$ver"
 }
-
-fabric_install() {
-  local mc="$1" loader_ver="$2"
-  local java
-  java="$(find_java)" || die "java not found in PATH/JAVA_HOME (required to install Fabric)."
-  export PATH="$(dirname "$java"):$PATH"
-  export JAVA_HOME="$(dirname "$(dirname "$java")")"
-
-  # Fabric installer: https://maven.fabricmc.net/net/fabricmc/fabric-installer/
-  # Resolve "latest" (or an unset/empty value) via the real maven-metadata.xml —
-  # Fabric's maven does NOT support "latest" as a literal path segment, so
-  # building the URL with that string produces a 404-style download failure.
-  local inst_ver="${FABRIC_INSTALLER_VERSION:-latest}"
-  if [[ -z "$inst_ver" || "$inst_ver" == "latest" ]]; then
-    inst_ver="$(curl -fsSL --retry 3 --max-time 15 \
-      https://maven.fabricmc.net/net/fabricmc/fabric-installer/maven-metadata.xml 2>/dev/null \
-      | grep -oP '(?<=<release>)[^<]+' | head -1 || true)"
-    inst_ver="${inst_ver:-1.0.1}"
-    echo "[curseforge] Resolved Fabric installer version: ${inst_ver}"
-  fi
-  local url="https://maven.fabricmc.net/net/fabricmc/fabric-installer/${inst_ver}/fabric-installer-${inst_ver}.jar"
-  echo "[curseforge] Installing Fabric server: mc=${mc} loader=${loader_ver} installer=${inst_ver}"
-  rm -f fabric-installer.jar
-  wget -qO fabric-installer.jar "$url" || die "Failed to download Fabric installer: $url"
-  "$java" -Djava.awt.headless=true -jar fabric-installer.jar server -mcversion "$mc" -loader "$loader_ver" -downloadMinecraft || die "Fabric installer failed."
-  rm -f fabric-installer.jar
-
-  if [[ -f "./run.sh" ]]; then
-    cat > ./start.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-chmod +x ./run.sh 2>/dev/null || true
-exec bash ./run.sh
-SH
-    chmod +x ./start.sh || true
-  fi
-}
-
-
 
 download_mods_from_manifest_if_needed() {
   # If the pack zip is a client pack, overrides/ may not include any mods.
@@ -364,6 +307,7 @@ download_mods_from_manifest_if_needed() {
   while read -r pid fid; do
     [[ -n "${pid:-}" && -n "${fid:-}" ]] || continue
     i=$((i+1))
+    bb_status downloading_mods "Downloading mods" "$i" "$total"
 
     # Get download URL from CurseForge API
     local api="https://api.curseforge.com/v1/mods/${pid}/files/${fid}/download-url"
@@ -503,8 +447,22 @@ download_mods_from_manifest_if_needed() {
     echo ""
   fi
 
-  # Don't exit nonzero just because some mods couldn't be downloaded (403/null url is common)
   rm -f .bb_manifest_mods.txt 2>/dev/null || true
+
+  # Mods the author blocks from third-party download can never be fetched —
+  # surface them in the panel but don't fail (the customer can upload them).
+  if [[ ${#skipped_mods[@]} -gt 0 ]]; then
+    bb_warn_status "${#skipped_mods[@]} mod(s) block automatic download and must be added to /mods by hand: $(printf '%s; ' "${skipped_mods[@]}")"
+  fi
+  # Mods that failed for network reasons would leave a broken server. Fail the
+  # install so switch_modpack.sh rolls back to the previous working version.
+  if [[ ${#failed_mods[@]} -gt 0 ]]; then
+    if [[ "${BB_ALLOW_MISSING_MODS:-0}" == "1" ]]; then
+      bb_warn_status "${#failed_mods[@]} mod(s) failed to download and are missing."
+    else
+      die "${#failed_mods[@]} mod(s) failed to download after retrying. Restart to try again (set BB_ALLOW_MISSING_MODS=1 to install anyway)."
+    fi
+  fi
 }
 
 # -----------------------------
@@ -523,25 +481,16 @@ if ! have_runnable; then
     echo "[curseforge] Manifest: mc=${mc} loader=${loader} ver=${loader_ver}"
 
     case "$loader" in
-      forge)
-        forge_install "$mc" "$loader_ver" || echo "[curseforge] WARN: forge_install failed; continuing anyway."
-        ;;
-      neoforge)
-        forge_install "$mc" "$loader_ver" || echo "[curseforge] WARN: neoforge_install failed; continuing anyway."
-        ;;
-      fabric)
-        fabric_install "$mc" "$loader_ver" || echo "[curseforge] WARN: fabric_install failed; continuing anyway."
-        ;;
-      quilt)
-        # Quilt uses the same installer interface as Fabric
-        fabric_install "$mc" "$loader_ver" || echo "[curseforge] WARN: quilt/fabric_install failed; continuing anyway."
+      forge|neoforge|fabric|quilt)
+        loader_install "$loader" "$mc" "$loader_ver" \
+          || die "Installing ${loader} ${loader_ver} for Minecraft ${mc} failed."
         ;;
       *)
-        echo "[curseforge] WARN: Unsupported loader '${loader}' in manifest; skipping bootstrap."
+        die "Unsupported loader '${loader}' in manifest.json."
         ;;
     esac
   else
-    echo "[curseforge] WARN: manifest.json not found or unparseable; cannot bootstrap loader."
+    die "This pack has no server files and no readable manifest.json, so the server can't be built."
   fi
 fi
 
@@ -584,9 +533,9 @@ ensure_forge_jar_for_scripts() {
     local forge_ver="${fv#*-}"
 
     if [[ -n "$mc_part" && -n "$forge_ver" && "$mc_part" != "$forge_ver" ]]; then
-      forge_install "$mc_part" "$forge_ver" 2>&1 || echo "[curseforge] WARN: Forge install for $fv failed."
+      loader_install forge "$mc_part" "$forge_ver" 2>&1 || echo "[curseforge] WARN: Forge install for $fv failed."
 
-      # If forge_install produced universal jar, link it
+      # If the Forge install produced a universal jar, link it
       local uni="forge-${fv}-universal.jar"
       if [[ -f "$uni" && ! -f "$jar_ref" ]]; then
         ln -sf "$uni" "$jar_ref" 2>/dev/null || cp -f "$uni" "$jar_ref" || true
@@ -611,7 +560,7 @@ ensure_forge_jar_for_scripts() {
           loader="$(echo "$loader_id" | cut -d'-' -f1)"
           loader_ver="$(echo "$loader_id" | cut -d'-' -f2-)"
           if [[ "$loader" == "forge" && -n "$loader_ver" ]]; then
-            forge_install "$mc" "$loader_ver" 2>&1 || echo "[curseforge] WARN: Forge install failed."
+            loader_install forge "$mc" "$loader_ver" 2>&1 || echo "[curseforge] WARN: Forge install failed."
           fi
         fi
       fi

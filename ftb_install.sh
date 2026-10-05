@@ -14,6 +14,14 @@ set -euo pipefail
 PACK_ID="${PACK_ID:-}"
 VERSION_ID="${VERSION_ID:-latest}"
 
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_here}/bb_lib.sh" ]]; then
+  # shellcheck source=bb_lib.sh
+  source "${_here}/bb_lib.sh"
+else
+  bb_status() { :; }
+fi
+
 if [[ -z "${PACK_ID}" ]]; then
   echo "[ftb] ERROR: PACK_ID is required."
   exit 1
@@ -55,8 +63,9 @@ else
 fi
 
 # Download the universal server installer binary (0/0) and run it to install the pack
+bb_status installing "Downloading the FTB installer"
 echo "[ftb] Downloading FTB server installer..."
-curl -fsSL "${API_BASE}/0/0/server/${INSTALLER_TYPE}" -o ./serversetup
+curl -fsSL --retry 3 --retry-delay 2 "${API_BASE}/0/0/server/${INSTALLER_TYPE}" -o ./serversetup
 chmod +x ./serversetup
 
 # Remove old forge/neoforge bits (helps updates / reinstall)
@@ -66,6 +75,7 @@ rm -rf libraries/net/neoforged/neoforge 2>/dev/null || true
 rm -f unix_args.txt 2>/dev/null || true
 rm -rf log4jfix/ 2>/dev/null || true
 
+bb_status installing "Installing FTB pack ${PACK_ID} (this can take a few minutes)"
 echo "[ftb] Running installer..."
 set +e
 if [[ -n "${FTB_VERSION_API_ID}" ]]; then

@@ -79,7 +79,7 @@ force_java_override() {
       fi
       ;;
     *)
-      log "[switch] WARN: JAVA_MAJOR='$maj' is not one of 8/11/17/21; ignoring"
+      log "[switch] WARN: JAVA_MAJOR='$maj' is not one of 8/11/17/21/25; ignoring"
       ;;
   esac
 }
@@ -106,6 +106,17 @@ DEBUG="${DEBUG:-0}"
 debug(){ if [[ "$DEBUG" == "1" || "$DEBUG" == "true" ]]; then echo "[switch][debug] $*"; fi; return 0; }
 
 has_glob() { compgen -G "$1" >/dev/null 2>&1; }
+
+# Final hand-off to the server process. BB_DRY_START=1 prints the command instead
+# (used by the test suite and handy for debugging which start method gets picked).
+_bb_exec() {
+  if [[ "${BB_DRY_START:-0}" == "1" ]]; then
+    echo "[switch] DRY_START: $*"
+    trap - EXIT
+    exit 0
+  fi
+  exec "$@"
+}
 
 # -----------------------------
 # Corruption/truncation check for jar-based artifacts.
@@ -268,12 +279,20 @@ RUNTIME_RAW_BASE="${RUNTIME_RAW_BASE:-https://raw.githubusercontent.com/BlazingB
 
 # Also self-update the installer scripts so fixes propagate to existing servers
 RUNTIME_SCRIPTS=(
+  "bb_lib.sh"
   "clientmod_cleaner.sh"
   "generate_jvm_args.sh"
   "curseforge_install.sh"
   "modrinth_install.sh"
   "ftb_install.sh"
 )
+
+# BB_SKIP_SELF_UPDATE=1 keeps whatever runtime is on disk (manual testing / hotfixing one server).
+if [[ "${BB_SKIP_SELF_UPDATE:-0}" == "1" ]]; then
+  log "BB_SKIP_SELF_UPDATE=1 — not updating runtime scripts from GitHub."
+  RUNTIME_SCRIPTS=()
+  touch ".bb_self_updated"
+fi
 
 for _script in "${RUNTIME_SCRIPTS[@]}"; do
   _url="${RUNTIME_RAW_BASE}/${_script}"
@@ -282,6 +301,7 @@ for _script in "${RUNTIME_SCRIPTS[@]}"; do
     # Validate before replacing — a bad download must never clobber a working script
     _sz="$(wc -c < "./${_script}.tmp" 2>/dev/null || echo 0)"
     _sb="$(head -n1 "./${_script}.tmp" 2>/dev/null | grep -c '#!/' || true)"
+    if ! bash -n "./${_script}.tmp" 2>/dev/null; then _sb=0; fi
     if [[ "$_sz" -lt 200 || "$_sb" -eq 0 ]]; then
       rm -f "./${_script}.tmp"
       log "WARN: Downloaded ${_script} looks invalid (size=${_sz}) — keeping existing version"
@@ -309,6 +329,7 @@ if [[ ! -f "$BB_SELF_UPDATED_FLAG" ]]; then
     # A bad/empty download would silently destroy the script and break all servers.
     _tmp_size="$(wc -c < "./switch_modpack.sh.tmp" 2>/dev/null || echo 0)"
     _tmp_has_shebang="$(head -n1 "./switch_modpack.sh.tmp" 2>/dev/null | grep -c '#!/' || true)"
+    if ! bash -n "./switch_modpack.sh.tmp" 2>/dev/null; then _tmp_has_shebang=0; fi
     if [[ "$_tmp_size" -lt 1000 || "$_tmp_has_shebang" -eq 0 ]]; then
       rm -f "./switch_modpack.sh.tmp"
       log "WARN: Downloaded switch_modpack.sh looks invalid (size=${_tmp_size}) — keeping existing version"
@@ -328,6 +349,99 @@ if [[ ! -f "$BB_SELF_UPDATED_FLAG" ]]; then
 fi
 # Always clean up the flag at the end of the self-update block so next boot re-checks
 rm -f "$BB_SELF_UPDATED_FLAG" 2>/dev/null || true
+
+# ---------------------------------------
+# Shared library (status file, Java, loaders, world archive, stash/rollback)
+# ---------------------------------------
+if [[ ! -s ./bb_lib.sh ]]; then
+  log "bb_lib.sh missing — fetching from ${RUNTIME_RAW_BASE}..."
+  curl -fsSL --retry 3 --retry-delay 2 --max-time 30 "${RUNTIME_RAW_BASE}/bb_lib.sh" -o ./bb_lib.sh.tmp 2>/dev/null \
+    && sed -i 's/\r$//' ./bb_lib.sh.tmp && bash -n ./bb_lib.sh.tmp && mv -f ./bb_lib.sh.tmp ./bb_lib.sh \
+    || rm -f ./bb_lib.sh.tmp
+fi
+if [[ ! -s ./bb_lib.sh ]]; then
+  err "bb_lib.sh is missing and could not be downloaded. Reinstall the server or check node network."
+  exit 1
+fi
+BB_DIR="$DIR"
+# shellcheck source=bb_lib.sh
+source ./bb_lib.sh
+
+# Run context — inherited by child installers so their status writes line up.
+BB_RUN_STARTED="$(bb_now)"
+export BB_DIR BB_RUN_STARTED BB_RUN_KIND="boot" BB_ROLLED_BACK=0 BB_REQUEST_ID=""
+rm -f "$BB_WARN_FILE" 2>/dev/null || true   # warnings are per-run
+
+# Any nonzero exit before the server takes over the process = failed boot/install.
+BB_CRASH_LOG=".bb_last_crash.log"
+_bb_on_exit() {
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    # If an install was mid-flight, never leave the server half-installed.
+    if [[ -d "$BB_STASH_DIR" ]]; then
+      log "Exiting with an install in progress — rolling back."
+      bb_stash_rollback || true
+      BB_ROLLED_BACK=1
+    fi
+    local cur_state=""
+    [[ -f "$BB_STATUS_FILE" ]] && cur_state="$(jq -r '.state // empty' "$BB_STATUS_FILE" 2>/dev/null || true)"
+    [[ "$cur_state" == "failed" ]] || bb_status failed "Startup script exited with code $rc" "" "" "exit code $rc"
+    {
+      echo "=== BlazingBlue crash log ==="
+      echo "Exit code: $rc"
+      echo "Time: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      echo "Provider: ${PROVIDER:-unknown}"
+      echo "MC Version: ${MC_VER:-unknown}"
+      echo "Loader: ${LOADER:-unknown}"
+      echo ""
+      echo "=== Last 60 lines of latest.log ==="
+      if [[ -f "./logs/latest.log" ]]; then tail -n 60 "./logs/latest.log"; else echo "(logs/latest.log not found)"; fi
+    } > "$BB_CRASH_LOG" 2>/dev/null || true
+    log "Exited with code $rc. Details saved to $BB_CRASH_LOG"
+  fi
+}
+trap '_bb_on_exit' EXIT
+
+# ---------------------------------------
+# Interrupted install recovery: if the container died mid-install last time,
+# the old install is still sitting in the stash. Put it back before doing anything.
+# ---------------------------------------
+if [[ -d "$BB_STASH_DIR" ]]; then
+  warn "Found an unfinished install from a previous boot — restoring the previous install first."
+  bb_stash_rollback
+  bb_warn_status "The previous install was interrupted and has been rolled back."
+fi
+
+# ---------------------------------------
+# One-shot panel request (.bb_request.json). Written by the panel backend before a
+# restart; consumed here so it only ever applies once. See CONTRACT.md.
+# ---------------------------------------
+BB_REQ_ACTION="" BB_REQ_LEVEL_NAME="" BB_REQ_LABEL="" BB_REQ_ARCHIVE_ID=""
+if [[ -f .bb_request.json ]]; then
+  if jq -e . .bb_request.json >/dev/null 2>&1; then
+    BB_REQUEST_ID="$(jq -r '.id // empty' .bb_request.json)"
+    BB_REQ_ACTION="$(jq -r '.action // empty' .bb_request.json)"
+    BB_REQ_LABEL="$(jq -r '.level_name // empty' .bb_request.json)"
+    BB_REQ_ARCHIVE_ID="$(jq -r '.archive_id // empty' .bb_request.json)"
+    [[ -n "$BB_REQ_LABEL" ]] && BB_REQ_LEVEL_NAME="$(bb_sanitize_level_name "$BB_REQ_LABEL")"
+    export BB_REQUEST_ID
+    log "Panel request: action=${BB_REQ_ACTION:-<none>} id=${BB_REQUEST_ID:-<none>}"
+  else
+    warn ".bb_request.json is not valid JSON — ignoring it."
+  fi
+  mv -f .bb_request.json .bb_request.last.json 2>/dev/null || rm -f .bb_request.json
+fi
+case "$BB_REQ_ACTION" in
+  ""|switch|new_world|restore_world|reinstall) ;;
+  *) bb_warn_status "Unknown request action '${BB_REQ_ACTION}' ignored."; BB_REQ_ACTION="" ;;
+esac
+if [[ "$BB_REQ_ACTION" == "restore_world" && ! -f "${BB_WORLDS_DIR}/${BB_REQ_ARCHIVE_ID}/meta.json" ]]; then
+  bb_warn_status "Requested world archive '${BB_REQ_ARCHIVE_ID}' does not exist; nothing was restored."
+  BB_REQ_ACTION=""
+fi
+# Keep the archive index honest (the panel may have deleted archive folders).
+[[ -d "$BB_WORLDS_DIR" ]] && bb_world_reindex
+bb_status checking "Checking server files"
 
 # If using CurseForge, map normalized PACK_ID into the legacy var name used by older code paths.
 if [[ "${PROVIDER:-}" == "curseforge" ]]; then
@@ -349,6 +463,16 @@ fi
 if [[ -z "${CF_PROJECT_ID}" && "$current_key" =~ ^curseforge::([0-9]+):: ]]; then
   CF_PROJECT_ID="${BASH_REMATCH[1]}"
   debug "CF_PROJECT_ID inferred from lock: $CF_PROJECT_ID"
+fi
+
+# Same idea for every modpack provider: a blank PACK_ID with a lock for the same
+# provider means "keep what's installed" (e.g. right after an egg migration reset
+# the variables) — never "switch to an unknown pack and archive the world".
+if [[ -z "${PACK_ID_NORM:-}" && "$current_key" =~ ^(curseforge|modrinth|ftb)::([^:]+):: ]] \
+   && [[ "${BASH_REMATCH[1]}" == "${PROVIDER:-}" ]]; then
+  PACK_ID_NORM="${BASH_REMATCH[2]}"
+  export PACK_ID_NORM
+  bb_warn_status "PACK_ID is blank; keeping the installed ${PROVIDER} pack ${PACK_ID_NORM}. Set PACK_ID in startup variables."
 fi
 
 # -----------------------------
@@ -424,6 +548,10 @@ if [[ "${PROVIDER:-}" == "curseforge" && "${VERSION_ID_NORM:-latest}" == "latest
   fi
 fi
 
+# Must pick exactly what modrinth_install.sh picks (newest release, else newest
+# anything), otherwise a newer beta would cause a reinstall on every boot.
+MR_LATEST_JQ='(map(select(.version_type=="release" and (.files|length>0))) | sort_by(.date_published) | last) // (map(select(.files|length>0)) | sort_by(.date_published) | last) | .id // empty'
+
 # For Modrinth: when VERSION_ID=latest, check live API for the latest version and store it
 # so restarts don't reinstall when the pack hasn't changed, but DO reinstall when it has.
 if [[ "${PROVIDER:-}" == "modrinth" && "${VERSION_ID_NORM:-latest}" == "latest" && -n "${PACK_ID_NORM:-}" ]]; then
@@ -432,9 +560,9 @@ if [[ "${PROVIDER:-}" == "modrinth" && "${VERSION_ID_NORM:-latest}" == "latest" 
     _mr_stored="$(cat ".bb_resolved_mr_version" 2>/dev/null | tr -d '[:space:]' || true)"
   fi
   log "VERSION_ID=latest: checking Modrinth for latest version of ${PACK_ID_NORM}..."
-  _mr_live="$(curl -fsSL --retry 2 --max-time 10 \
+  _mr_live="$(curl -fsSL -A "$BB_UA" --retry 2 --max-time 10 \
     "https://api.modrinth.com/v2/project/${PACK_ID_NORM}/version" 2>/dev/null \
-    | jq -r 'sort_by(.date_published) | reverse | .[0].id // empty' 2>/dev/null | tr -d '[:space:]' || true)"
+    | jq -r "$MR_LATEST_JQ" 2>/dev/null | tr -d '[:space:]' || true)"
 
   if [[ -n "$_mr_live" && "$_mr_live" != "null" ]]; then
     if [[ -n "$_mr_stored" && "$_mr_live" == "$_mr_stored" ]]; then
@@ -497,7 +625,7 @@ if [[ "${PROVIDER:-}" == "ftb" && "${VERSION_ID_NORM:-latest}" == "latest" && -n
 fi
 
 case "${PROVIDER:-unknown}" in
-  vanilla|paper|fabric|forge|neoforge)
+  vanilla|paper|fabric|quilt|forge|neoforge)
     desired_key="${PROVIDER:-unknown}::${MC_VERSION:-latest}::${VERSION_ID_NORM:-latest}"
     ;;
   curseforge)
@@ -538,31 +666,20 @@ case "${PROVIDER:-unknown}" in
 esac
 
 # ---------------------------------------
-# Auto-wipe detection: switching to a genuinely different modpack (different
-# provider or different project/pack ID) should wipe the world, since an old
-# world's saved dimension/chunk data can reference mods that no longer exist
-# under the new pack, crashing the server on boot. Just updating the VERSION
-# of the same modpack should NOT wipe — that's a normal update and the world
-# should carry over. Every lock key is "provider::identity::version", so
-# comparing provider+identity (ignoring the version segment) distinguishes
-# the two cases cleanly.
+# Switch vs update. Every lock key is "provider::identity::version".
+#   - Same identity, new version  -> UPDATE: keep the world (backed up first).
+#   - Different identity          -> SWITCH: archive the old world, start fresh.
+# Standalone types (vanilla/paper/fabric/...) key on the provider alone, so a
+# Minecraft version bump on Paper is an update, not a new world.
+# Nothing is ever deleted: switched-away worlds go to .bb_worlds/ and can be restored.
 # ---------------------------------------
-pack_identity() {
-  local key="$1"
-  if [[ "$key" =~ ^([^:]+)::([^:]*)::(.*)$ ]]; then
-    echo "${BASH_REMATCH[1]}::${BASH_REMATCH[2]}"
-  else
-    echo "$key"
-  fi
-}
-AUTO_WIPE_WORLD_ON_SWITCH=0
+IS_SWITCH=0
 if [[ "$current_key" != "<none>" ]]; then
-  _current_identity="$(pack_identity "$current_key")"
-  _desired_identity="$(pack_identity "$desired_key")"
+  _current_identity="$(bb_key_identity "$current_key")"
+  _desired_identity="$(bb_key_identity "$desired_key")"
   if [[ "$_current_identity" != "$_desired_identity" ]]; then
-    log "Modpack changed (${_current_identity} -> ${_desired_identity}) — different pack, not just a version update."
-    log "World will be auto-wiped so the new pack can generate a compatible one."
-    AUTO_WIPE_WORLD_ON_SWITCH=1
+    log "Pack changed (${_current_identity} -> ${_desired_identity}) — the current world will be archived."
+    IS_SWITCH=1
   fi
 fi
 unset _current_identity _desired_identity
@@ -599,6 +716,7 @@ if glob_jar_ok "./quilt-server-launch*.jar" 1000; then has_any_start_artifact=1;
 if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then has_any_start_artifact=1; fi
+if [[ "${PROVIDER:-}" == "bedrock" && -f "./bedrock_server" ]]; then has_any_start_artifact=1; fi
 if [[ "$has_any_start_artifact" -eq 0 ]]; then
   need_reinstall=1
   log "Start artifacts missing; forcing reinstall."
@@ -612,178 +730,38 @@ if [[ "$need_reinstall" -eq 1 && "${PROVIDER:-}" == "curseforge" && -z "${CF_PRO
 fi
 
 # ---------------------------------------
-# Deep wipe (preserve important folders)
-# ---------------------------------------
-deep_wipe() {
-  log "Deep wiping server directory (keeping world, player data, configs, backups, and scripts)..."
-  mkdir -p .bb_tmp_preserve
-
-  # --- Resolve world folder name from server.properties (default: world) ---
-  local _level_name="world"
-  if [[ -f "./server.properties" ]]; then
-    local _ln
-    _ln="$(grep -E '^level-name\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')" || true
-    [[ -n "${_ln:-}" ]] && _level_name="$_ln"
-  fi
-
-  # --- World folders ---
-  for p in "$_level_name" "${_level_name}_nether" "${_level_name}_the_end" \
-            "world" "world_nether" "world_the_end" "DIM-1" "DIM1"; do
-    [[ -e "$p" ]] && mv "$p" .bb_tmp_preserve/ 2>/dev/null || true
-  done
-
-  # --- Player data & server identity files ---
-  for p in ops.json whitelist.json banned-players.json banned-ips.json \
-            usercache.json usernamecache.json server.properties eula.txt \
-            server-icon.png; do
-    [[ -e "$p" ]] && cp -a "$p" .bb_tmp_preserve/ 2>/dev/null || true
-  done
-
-  # --- Preserve common backup folders and our install scripts ---
-  for p in backups archives world-backups .bb_backups; do
-    [[ -e "$p" ]] && mv "$p" .bb_tmp_preserve/ 2>/dev/null || true
-  done
-  for p in curseforge_install.sh modrinth_install.sh ftb_install.sh switch_modpack.sh; do
-    [[ -e "$p" ]] && cp -a "$p" .bb_tmp_preserve/ 2>/dev/null || true
-  done
-
-  shopt -s dotglob nullglob
-  for x in *; do
-    # keep preserve dir itself
-    [[ "$x" == ".bb_tmp_preserve" ]] && continue
-    rm -rf -- "$x" || true
-  done
-  shopt -u dotglob nullglob
-
-  # restore
-  shopt -s dotglob nullglob
-  for x in .bb_tmp_preserve/*; do
-    mv "$x" ./ 2>/dev/null || true
-  done
-  shopt -u dotglob nullglob
-  rm -rf .bb_tmp_preserve || true
-  log "Wipe complete. Preserved: world='${_level_name}', ops/whitelist/bans, server.properties, eula.txt."
-
-  # Re-download any runtime scripts that didn't survive the wipe
-  # (shouldn't happen since we preserve them above, but safety net)
-  local _raw="${RUNTIME_RAW_BASE:-https://raw.githubusercontent.com/BlazingBlue04/runtime/main}"
-  for _s in switch_modpack.sh curseforge_install.sh modrinth_install.sh ftb_install.sh clientmod_cleaner.sh generate_jvm_args.sh; do
-    if [[ ! -f "./$_s" ]]; then
-      log "WARN: $_s missing after wipe — re-downloading from GitHub..."
-      curl -fsSL --retry 3 --retry-delay 2 --max-time 15 "$_raw/$_s" -o "./$_s" 2>/dev/null \
-        && sed -i 's/\r$//' "./$_s" && chmod +x "./$_s" \
-        || log "ERROR: Could not re-download $_s — install may fail"
-    fi
-  done
-  unset _s _raw
-}
-
-# ---------------------------------------
 # Installer hook (expects curseforge_install.sh from your unified egg install)
 # ---------------------------------------
 run_installer() {
   log "Running installer for provider=$PROVIDER..."
   case "$PROVIDER" in
     curseforge)
-      if [[ ! -x "./curseforge_install.sh" ]]; then
-        err "curseforge_install.sh missing or not executable."
+      if [[ ! -f "./curseforge_install.sh" ]]; then
+        err "curseforge_install.sh missing."
         exit 1
       fi
       # Export the resolved vars so curseforge_install.sh can read them from env
       export PACK_ID="${PACK_ID_NORM:-${CF_PROJECT_ID:-}}"
       export VERSION_ID="${VERSION_ID_NORM:-${CF_FILE_ID:-latest}}"
-      ./curseforge_install.sh
-      ;;
-    vanilla)
-      local mc_ver="${MC_VERSION:-latest}"
-      log "Installing vanilla server (mc=$mc_ver)..."
-      local manifest_json
-      manifest_json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 15 \
-        https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null || true)"
-      if [[ -z "$manifest_json" ]]; then
-        err "Could not reach Mojang version manifest API."
-        exit 1
-      fi
-      log "Manifest fetched (${#manifest_json} bytes)"
-      if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(echo "$manifest_json" | jq -r '.latest.release // empty' | tr -d '\r\n' | xargs)"
-        log "Parsed mc_ver='$mc_ver'"
-        if [[ -z "$mc_ver" ]]; then
-          err "Could not parse latest Minecraft version from Mojang manifest."
-          log "First 200 chars of manifest: ${manifest_json:0:200}"
-          exit 1
-        fi
-        log "Resolved latest vanilla version: $mc_ver"
-      fi
-      # Fetch version-specific manifest URL
-      local version_url
-      version_url="$(echo "$manifest_json" | jq -r --arg v "$mc_ver" '.versions[] | select(.id==$v) | .url' | head -n1)"
-      if [[ -z "$version_url" ]]; then
-        err "Could not find version manifest URL for minecraft $mc_ver."
-        exit 1
-      fi
-      # Fetch server jar URL
-      local version_manifest jar_url
-      version_manifest="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 15 "$version_url" 2>/dev/null || true)"
-      jar_url="$(echo "$version_manifest" | jq -r '.downloads.server.url // empty')"
-      if [[ -z "$jar_url" ]]; then
-        err "Could not find server jar URL for minecraft $mc_ver."
-        exit 1
-      fi
-      log "Downloading vanilla server jar: $jar_url"
-      curl -fsSL --retry 3 --retry-delay 2 --max-time 120 -o server.jar "$jar_url"
-      log "Vanilla $mc_ver installed."
-      ;;
-    paper)
-      local mc_ver="${MC_VERSION:-latest}"
-      log "Installing Paper server (mc=$mc_ver)..."
-      local paper_versions_json
-      paper_versions_json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 15 \
-        https://api.papermc.io/v2/projects/paper 2>/dev/null || true)"
-      if [[ -z "$paper_versions_json" ]]; then
-        err "Could not reach PaperMC API."
-        exit 1
-      fi
-      if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(echo "$paper_versions_json" | jq -r '[.versions[] | select(test("pre|rc|snapshot") | not)] | last // empty' 2>/dev/null | tr -d '[:space:]')"
-        if [[ -z "$mc_ver" ]]; then
-          err "Could not parse latest Paper MC version."
-          exit 1
-        fi
-        log "Resolved latest Paper MC version: $mc_ver"
-      fi
-      local builds_json build
-      builds_json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 15 \
-        "https://api.papermc.io/v2/projects/paper/versions/${mc_ver}/builds" 2>/dev/null || true)"
-      build="$(echo "$builds_json" | jq -r '[.builds[] | select(.channel == "default")] | last | .build // empty' 2>/dev/null | tr -d '[:space:]')"
-      if [[ -z "$build" ]]; then
-        err "Could not determine latest Paper build for MC $mc_ver."
-        exit 1
-      fi
-      local paper_jar="paper-${mc_ver}-${build}.jar"
-      local paper_url="https://api.papermc.io/v2/projects/paper/versions/${mc_ver}/builds/${build}/downloads/${paper_jar}"
-      log "Downloading Paper $mc_ver build $build: $paper_url"
-      curl -fsSL --retry 3 --retry-delay 2 --max-time 120 -o server.jar "$paper_url"
-      accept_eula
-      log "Paper $mc_ver build $build installed."
+      bash ./curseforge_install.sh
       ;;
     modrinth)
-      if [[ ! -x "./modrinth_install.sh" ]]; then
-        err "modrinth_install.sh missing or not executable."
+      if [[ ! -f "./modrinth_install.sh" ]]; then
+        err "modrinth_install.sh missing."
         exit 1
       fi
       export PACK_ID="${PACK_ID_NORM:-}"
       export VERSION_ID="${VERSION_ID_NORM:-latest}"
-      ./modrinth_install.sh
+      bash ./modrinth_install.sh
       ;;
     ftb)
-      if [[ ! -x "./ftb_install.sh" ]]; then
-        err "ftb_install.sh missing or not executable."
+      if [[ ! -f "./ftb_install.sh" ]]; then
+        err "ftb_install.sh missing."
         exit 1
       fi
       export PACK_ID="${PACK_ID_NORM:-}"
       export VERSION_ID="${VERSION_ID_NORM:-latest}"
-      ./ftb_install.sh
+      bash ./ftb_install.sh
       ;;
     bedrock)
       local bv="${BEDROCK_VERSION:-latest}"
@@ -820,176 +798,25 @@ run_installer() {
       chmod +x bedrock_server 2>/dev/null || true
       log "Bedrock server installed."
       ;;
-    fabric)
-      local mc_ver="${MC_VERSION:-latest}"
-      local loader_ver="${FABRIC_LOADER_VERSION:-latest}"
-      local inst_ver="${FABRIC_INSTALLER_VERSION:-latest}"
-      log "Installing Fabric server (mc=$mc_ver loader=$loader_ver)..."
-
-      # Resolve latest MC version
-      if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
-          | jq -r '.latest.release // empty' 2>/dev/null || true)"
-        [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
-        log "Resolved latest MC version: $mc_ver"
+    vanilla|paper|fabric|quilt|forge|neoforge)
+      local lv=""
+      case "$PROVIDER" in
+        fabric|quilt) lv="${FABRIC_LOADER_VERSION:-latest}" ;;  # quilt reuses FABRIC_LOADER_VERSION
+        forge)        lv="${FORGE_VERSION:-latest}" ;;
+        neoforge)     lv="${NEOFORGE_VERSION:-latest}" ;;
+      esac
+      bb_status installing "Installing ${PROVIDER} ${MC_VERSION:-latest}"
+      if ! bb_install_loader "$PROVIDER" "${MC_VERSION:-latest}" "$lv"; then
+        err "Installing ${PROVIDER} (mc=${MC_VERSION:-latest} loader=${lv:-n/a}) failed."
+        exit 1
       fi
-
-      # Resolve latest Fabric installer version
-      if [[ "$inst_ver" == "latest" ]]; then
-        inst_ver="$(curl -fsSL --retry 3 --max-time 15 \
-          https://maven.fabricmc.net/net/fabricmc/fabric-installer/maven-metadata.xml 2>/dev/null \
-          | grep -oP '(?<=<release>)[^<]+' | head -1 || true)"
-        inst_ver="${inst_ver:-1.0.1}"
-        log "Resolved Fabric installer version: $inst_ver"
-      fi
-
-      local inst_url="https://maven.fabricmc.net/net/fabricmc/fabric-installer/${inst_ver}/fabric-installer-${inst_ver}.jar"
-      log "Downloading Fabric installer: $inst_url"
-      curl -fsSL --retry 3 --max-time 60 -o fabric-installer.jar "$inst_url" \
-        || { err "Failed to download Fabric installer."; exit 1; }
-
-      local java_bin
-      java_bin="$(java_for "$mc_ver" "fabric")"
-      export PATH="$(dirname "$java_bin"):$PATH"
-      export JAVA_HOME="$(dirname "$(dirname "$java_bin")")"
-
-      "$java_bin" -Djava.awt.headless=true -jar fabric-installer.jar server \
-        -mcversion "$mc_ver" \
-        ${loader_ver:+"-loader" "$loader_ver"} \
-        -downloadMinecraft \
-        || { err "Fabric installer failed."; exit 1; }
-      rm -f fabric-installer.jar
       accept_eula
-      log "Fabric $mc_ver installed."
-      ;;
-    quilt)
-      local mc_ver="${MC_VERSION:-latest}"
-      local loader_ver="${FABRIC_LOADER_VERSION:-latest}"  # reuse FABRIC_LOADER_VERSION for quilt
-      log "Installing Quilt server (mc=$mc_ver)..."
-
-      if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
-          | jq -r '.latest.release // empty' 2>/dev/null || true)"
-        [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
-      fi
-
-      # Get latest Quilt installer
-      local quilt_inst_ver
-      quilt_inst_ver="$(curl -fsSL --retry 3 --max-time 15 \
-        https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-installer/maven-metadata.xml 2>/dev/null \
-        | grep -oP '(?<=<release>)[^<]+' | head -1 || true)"
-      quilt_inst_ver="${quilt_inst_ver:-0.9.3}"
-      log "Quilt installer version: $quilt_inst_ver"
-
-      local inst_url="https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-installer/${quilt_inst_ver}/quilt-installer-${quilt_inst_ver}.jar"
-      log "Downloading Quilt installer: $inst_url"
-      curl -fsSL --retry 3 --max-time 60 -o quilt-installer.jar "$inst_url" \
-        || { err "Failed to download Quilt installer."; exit 1; }
-
-      local java_bin
-      java_bin="$(java_for "$mc_ver" "fabric")"
-      export PATH="$(dirname "$java_bin"):$PATH"
-      export JAVA_HOME="$(dirname "$(dirname "$java_bin")")"
-
-      "$java_bin" -Djava.awt.headless=true -jar quilt-installer.jar install server "$mc_ver" \
-        ${loader_ver:+"--loader-version=$loader_ver"} \
-        --download-server --install-dir=. \
-        || { err "Quilt installer failed."; exit 1; }
-      rm -f quilt-installer.jar
-      accept_eula
-      log "Quilt $mc_ver installed."
-      ;;
-    forge)
-      local mc_ver="${MC_VERSION:-latest}"
-      local forge_ver="${FORGE_VERSION:-latest}"
-      log "Installing Forge server (mc=$mc_ver forge=$forge_ver)..."
-
-      if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
-          | jq -r '.latest.release // empty' 2>/dev/null || true)"
-        [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
-      fi
-
-      if [[ "$forge_ver" == "latest" || -z "$forge_ver" ]]; then
-        local _promos
-        _promos="$(curl -fsSL --retry 3 --max-time 15 \
-          "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json" 2>/dev/null || true)"
-        # Try recommended first, then latest
-        forge_ver="$(echo "$_promos" | jq -r --arg k "${mc_ver}-recommended" '.promos[$k] // empty' 2>/dev/null || true)"
-        if [[ -z "$forge_ver" ]]; then
-          forge_ver="$(echo "$_promos" | jq -r --arg k "${mc_ver}-latest" '.promos[$k] // empty' 2>/dev/null || true)"
-        fi
-        if [[ -z "$forge_ver" ]]; then
-          err "Could not resolve Forge version for MC $mc_ver. Set FORGE_VERSION explicitly (e.g. 1.20.1-47.2.0)."
-          exit 1
-        fi
-        log "Resolved Forge version: $forge_ver"
-      fi
-
-      local java_bin
-      java_bin="$(java_for "$mc_ver" "forge")"
-      export PATH="$(dirname "$java_bin"):$PATH"
-      export JAVA_HOME="$(dirname "$(dirname "$java_bin")")"
-
-      local full_ver="${mc_ver}-${forge_ver}"
-      local inst_jar="forge-${full_ver}-installer.jar"
-      local inst_url="https://maven.minecraftforge.net/net/minecraftforge/forge/${full_ver}/${inst_jar}"
-      log "Downloading Forge installer: $inst_url"
-      curl -fsSL --retry 3 --max-time 120 -o "$inst_jar" "$inst_url" \
-        || { err "Failed to download Forge installer from $inst_url"; exit 1; }
-
-      "$java_bin" -Djava.awt.headless=true -jar "$inst_jar" --installServer \
-        || { err "Forge installer failed."; exit 1; }
-      rm -f "$inst_jar" 2>/dev/null || true
-      log "Forge ${full_ver} installed."
-      ;;
-    neoforge)
-      local mc_ver="${MC_VERSION:-latest}"
-      local neo_ver="${NEOFORGE_VERSION:-latest}"
-      log "Installing NeoForge server (mc=$mc_ver neo=$neo_ver)..."
-
-      if [[ "$mc_ver" == "latest" ]]; then
-        mc_ver="$(curl -fsSL --retry 3 --max-time 15 https://launchermeta.mojang.com/mc/game/version_manifest.json 2>/dev/null \
-          | jq -r '.latest.release // empty' 2>/dev/null || true)"
-        [[ -z "$mc_ver" ]] && { err "Could not resolve latest Minecraft version."; exit 1; }
-      fi
-
-      if [[ "$neo_ver" == "latest" || -z "$neo_ver" ]]; then
-        # NeoForge versions are like 21.1.x for MC 1.21.1 — strip leading "1."
-        local neo_mc_prefix
-        neo_mc_prefix="$(echo "$mc_ver" | sed 's/^1\.//')"
-        neo_ver="$(curl -fsSL --retry 3 --max-time 15 \
-          "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml" 2>/dev/null \
-          | grep -oP "(?<=<version>)${neo_mc_prefix}\.[0-9.]+(?=</version>)" \
-          | sort -V | tail -1 || true)"
-        if [[ -z "$neo_ver" ]]; then
-          err "Could not resolve NeoForge version for MC $mc_ver. Set NEOFORGE_VERSION explicitly (e.g. 21.1.74)."
-          exit 1
-        fi
-        log "Resolved NeoForge version: $neo_ver"
-      fi
-
-      local java_bin
-      java_bin="$(java_for "$mc_ver" "neoforge")"
-      export PATH="$(dirname "$java_bin"):$PATH"
-      export JAVA_HOME="$(dirname "$(dirname "$java_bin")")"
-
-      local inst_jar="neoforge-${neo_ver}-installer.jar"
-      local inst_url="https://maven.neoforged.net/releases/net/neoforged/neoforge/${neo_ver}/${inst_jar}"
-      log "Downloading NeoForge installer: $inst_url"
-      curl -fsSL --retry 3 --max-time 120 -o "$inst_jar" "$inst_url" \
-        || { err "Failed to download NeoForge installer from $inst_url"; exit 1; }
-
-      "$java_bin" -Djava.awt.headless=true -jar "$inst_jar" --installServer \
-        || { err "NeoForge installer failed."; exit 1; }
-      rm -f "$inst_jar" 2>/dev/null || true
-      log "NeoForge ${neo_ver} installed."
+      log "${PROVIDER} installed."
       ;;
     *)
-      err "Unsupported provider: $PROVIDER. Valid providers: vanilla, paper, fabric, forge, neoforge, curseforge, modrinth, ftb, bedrock"
+      err "Unsupported provider: $PROVIDER. Valid providers: vanilla, paper, fabric, quilt, forge, neoforge, curseforge, modrinth, ftb, bedrock"
       exit 1
       ;;
-
   esac
 }
 
@@ -1005,6 +832,13 @@ strip_mc() {
 
 detect_mc_version() {
   local v=""
+
+  # 0. Written by bb_install_loader at install time — exact, not guessed.
+  if [[ -f ".bb_install_meta.json" ]]; then
+    v="$(jq -r '.mc_version // empty' .bb_install_meta.json 2>/dev/null | tr -d '[:space:]')" || v=""
+    if [[ -n "$v" && "$v" != "null" && "$v" != "latest" ]]; then echo "$v"; return; fi
+    v=""
+  fi
 
   # 1. Read from .bb_pack_info.json (written after install — most reliable)
   if [[ -f ".bb_pack_info.json" ]]; then
@@ -1069,6 +903,12 @@ detect_mc_version() {
 }
 
 detect_loader() {
+  if [[ "${PROVIDER:-}" == "bedrock" ]]; then echo "bedrock"; return; fi
+  if [[ -f ".bb_install_meta.json" ]]; then
+    local ml
+    ml="$(jq -r '.loader // empty' .bb_install_meta.json 2>/dev/null || true)"
+    if [[ -n "$ml" && "$ml" != "null" ]]; then echo "$ml"; return; fi
+  fi
   if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then echo "neoforge"; return; fi
   if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then echo "forge"; return; fi
   if has_glob "./libraries/org/quiltmc/quilt-loader/*/quilt-loader-*.jar"; then echo "quilt"; return; fi
@@ -1101,45 +941,12 @@ detect_loader() {
 # Java selection
 # ---------------------------------------
 java_for() {
-  local mc="$1"
-  local loader="$2"
-
-  # NeoForge always requires Java 21
-  if [[ "$loader" == "neoforge" ]]; then
-    echo "/opt/java/21/bin/java"; return
-  fi
-
-  # Unknown MC version — default to 21 (modern default)
-  if [[ "$mc" == "<unknown>" ]]; then
-    echo "/opt/java/21/bin/java"; return
-  fi
-
-  # Parse minor version (classic "1.x" scheme)
-  if [[ "$mc" =~ ^1\.([0-9]+) ]]; then
-    local minor="${BASH_REMATCH[1]}"
-
-    # 1.0 – 1.16: Java 8
-    if (( minor <= 16 )); then echo "/opt/java/8/bin/java"; return; fi
-
-    # 1.17 – 1.20: Java 17
-    if (( minor <= 20 )); then echo "/opt/java/17/bin/java"; return; fi
-
-    # 1.21+: Java 21
-    echo "/opt/java/21/bin/java"; return
-  fi
-
-  # Calendar-based major versions (Minecraft moved away from "1.x" starting
-  # with version 26 — e.g. "26.1", "26.2"). These require newer Java than
-  # the old 1.21 -> Java 21 mapping above.
-  if [[ "$mc" =~ ^([0-9]+)\. ]]; then
-    local major="${BASH_REMATCH[1]}"
-    if (( major >= 26 )); then echo "/opt/java/25/bin/java"; return; fi
-    # Shouldn't normally hit this (no MC major between "1" and "26" exists),
-    # but fall through to the modern default just in case.
-  fi
-
-  # Non-standard version string — default to 21
-  echo "/opt/java/21/bin/java"
+  # $2 (loader) no longer changes the answer: the Minecraft version decides.
+  # (Old code forced Java 21 for all NeoForge, which is wrong for 1.20.1-1.20.4.)
+  local mc="$1" j
+  if [[ "$mc" == "<unknown>" ]]; then mc=""; fi
+  j="$(JAVA_MAJOR="" bb_java_bin "$mc")" || j="/opt/java/21/bin/java"
+  echo "$j"
 }
 
 # ---------------------------------------
@@ -1560,13 +1367,13 @@ run_start_candidate() {
       log "Starting Forge via unix_args.txt: $unix_args"
       # typical layout also includes user_jvm_args.txt at root; optional
       if [[ -f ./user_jvm_args.txt ]]; then
-        exec "$JAVA" @./user_jvm_args.txt @"$unix_args" nogui
+        _bb_exec "$JAVA" @./user_jvm_args.txt @"$unix_args" nogui
       else
         # No argfile with memory settings — pass them explicitly (direct exec bypasses the shim)
         local _mf=()
         if [[ -n "${MIN_RAM:-}" ]]; then _mf+=("-Xms${MIN_RAM}"); fi
         if [[ -n "${MAX_RAM:-}" ]]; then _mf+=("-Xmx${MAX_RAM}"); fi
-        exec "$JAVA" "${_mf[@]}" @"$unix_args" nogui
+        _bb_exec "$JAVA" "${_mf[@]}" @"$unix_args" nogui
       fi
       ;;
     JAR::* )
@@ -1589,12 +1396,12 @@ run_start_candidate() {
       local _mf=()
       if [[ -n "${MIN_RAM:-}" ]]; then _mf+=("-Xms${MIN_RAM}"); fi
       if [[ -n "${MAX_RAM:-}" ]]; then _mf+=("-Xmx${MAX_RAM}"); fi
-      exec "$JAVA" "${_mf[@]}" -jar "$jar" nogui
+      _bb_exec "$JAVA" "${_mf[@]}" -jar "$jar" nogui
       ;;
     * )
       log "Starting via script: $cand"
       preflight_start_script "$cand"
-      exec bash "$cand"
+      _bb_exec bash "$cand"
       ;;
   esac
 }
@@ -1750,6 +1557,19 @@ accept_eula() {
 }
 
 start_server() {
+  # Bedrock is a native binary — none of the Java logic below applies.
+  if [[ "${PROVIDER:-}" == "bedrock" ]]; then
+    if [[ -f ./bedrock_server ]]; then
+      chmod +x ./bedrock_server 2>/dev/null || true
+      export LD_LIBRARY_PATH=".${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      bb_status starting "Starting server"
+      log "Starting Bedrock server"
+      _bb_exec ./bedrock_server
+    fi
+    err "bedrock_server binary not found after install."
+    exit 1
+  fi
+
   # Always accept EULA before any launch (packs sometimes recreate eula.txt)
   accept_eula
 
@@ -1777,6 +1597,8 @@ start_server() {
 
   # Force memory even if LaunchServer.sh hardcodes -Xmx4G
   ensure_java_wrapper "$JAVA"
+
+  bb_status starting "Starting server"
 
   # 1) Dedicated run scripts (best)
   for s in "./run.sh" "./startserver.sh" "./LaunchServer.sh" "./ServerStart.sh" "./StartServer.sh"; do
@@ -1841,7 +1663,7 @@ start_server() {
       local tmp=".bb_tmp_start.sh"
       sanitize_start_script "$s" "$tmp"
       # Execute with bash to avoid "sh" incompatibilities
-      exec bash "$tmp"
+      _bb_exec bash "$tmp"
     fi
   done
 
@@ -1859,12 +1681,12 @@ start_server() {
     log "Starting via argfiles: @user_jvm_args.txt + @$neo_args"
     # Ensure user_jvm_args.txt exists
     [[ -f "user_jvm_args.txt" ]] || echo "" > user_jvm_args.txt
-    exec "$JAVA" @"user_jvm_args.txt" @"$neo_args" nogui
+    _bb_exec "$JAVA" @"user_jvm_args.txt" @"$neo_args" nogui
   fi
   if [[ -n "$forge_args" ]]; then
     log "Starting via argfiles: @user_jvm_args.txt + @$forge_args"
     [[ -f "user_jvm_args.txt" ]] || echo "" > user_jvm_args.txt
-    exec "$JAVA" @"user_jvm_args.txt" @"$forge_args" nogui
+    _bb_exec "$JAVA" @"user_jvm_args.txt" @"$forge_args" nogui
   fi
 
   # 3) Jar fallbacks
@@ -1874,15 +1696,26 @@ start_server() {
   if [[ -n "${MIN_RAM:-}" ]]; then _memflags+=("-Xms${MIN_RAM}"); fi
   if [[ -n "${MAX_RAM:-}" ]]; then _memflags+=("-Xmx${MAX_RAM}"); fi
 
+  # Fabric/Quilt installers leave BOTH a launcher jar and server.jar (= vanilla).
+  # Launching server.jar would silently start a vanilla server with no mods.
+  if jar_ok "./fabric-server-launch.jar" 1000; then
+    log "Starting via fabric-server-launch.jar (Xmx=${MAX_RAM:-default})"
+    _bb_exec "$JAVA" "${_memflags[@]}" -jar ./fabric-server-launch.jar nogui
+  fi
+  if jar_ok "./quilt-server-launch.jar" 1000; then
+    log "Starting via quilt-server-launch.jar (Xmx=${MAX_RAM:-default})"
+    _bb_exec "$JAVA" "${_memflags[@]}" -jar ./quilt-server-launch.jar nogui
+  fi
+
   if [[ -f "./server.jar" ]]; then
     log "Starting via server.jar (Xmx=${MAX_RAM:-default})"
-    exec "$JAVA" "${_memflags[@]}" -jar ./server.jar nogui
+    _bb_exec "$JAVA" "${_memflags[@]}" -jar ./server.jar nogui
   fi
 
   # FTB installs rename the forge jar to start-server.jar
   if [[ -f "./start-server.jar" ]]; then
     log "Starting via start-server.jar (Xmx=${MAX_RAM:-default})"
-    exec "$JAVA" "${_memflags[@]}" -jar ./start-server.jar nogui
+    _bb_exec "$JAVA" "${_memflags[@]}" -jar ./start-server.jar nogui
   fi
 
   # Prefer a top-level forge-*.jar.
@@ -1918,14 +1751,14 @@ start_server() {
         err "Forge installer finished but no runnable start method was produced."
         exit 1
       fi
-      exec "$JAVA" "${_memflags[@]}" -jar "$j" nogui
+      _bb_exec "$JAVA" "${_memflags[@]}" -jar "$j" nogui
     else
       # Old Forge jars (1.12.2 and earlier) may still be launchable with -jar on Java 8.
       local java_ver_str=""
       java_ver_str="$("$JAVA" -version 2>&1 | head -n1 || true)"
       if [[ "$java_ver_str" =~ (1\.8\.|\"1\.8) ]]; then
         log "Starting via legacy Forge jar (Java 8): $j"
-        exec "$JAVA" "${_memflags[@]}" -jar "$j" nogui
+        _bb_exec "$JAVA" "${_memflags[@]}" -jar "$j" nogui
       else
         warn "Refusing to start non-executable jar fallback (no Main-Class): $j"
       fi
@@ -1965,26 +1798,151 @@ start_server() {
 # MANUALLY_MANAGED — permanent opt-out for servers with a hand-placed pack
 # (e.g. an official server pack extracted directly, not installed through
 # curseforge_install.sh). Set MANUALLY_MANAGED=true in Pterodactyl startup
-# variables to guarantee deep_wipe/run_installer NEVER run on this server,
-# no matter what happens to VERSION_ID, CF_API_KEY, or .modpack.lock later.
-# Everything else (self-update, client mod cleaner, JVM args, server start)
-# still runs normally — this only disables the install/reinstall path.
+# variables to guarantee run_installer NEVER runs on this server and the world
+# is never archived by a pack change, no matter what happens to VERSION_ID,
+# CF_API_KEY, or .modpack.lock later. Everything else (self-update, client mod
+# cleaner, JVM args, server start) still runs normally.
 # ---------------------------------------
+MANUAL=0
 if [[ "${MANUALLY_MANAGED:-false}" == "true" || "${MANUALLY_MANAGED:-false}" == "1" ]]; then
-  if [[ "$need_reinstall" -eq 1 ]]; then
+  MANUAL=1
+  if [[ "$need_reinstall" -eq 1 || "$IS_SWITCH" -eq 1 || "$BB_REQ_ACTION" == "reinstall" || "$BB_REQ_ACTION" == "switch" ]]; then
     log "MANUALLY_MANAGED=true — a reinstall would normally trigger here, but it's being SKIPPED because this server's mods/config are managed by hand. If you actually want to change the modpack, either unset MANUALLY_MANAGED first, or update the files manually yourself."
+    bb_warn_status "This server is manually managed, so the modpack was not changed."
   fi
   need_reinstall=0
+  IS_SWITCH=0
 fi
+
+if [[ "$BB_REQ_ACTION" == "reinstall" && "$MANUAL" -eq 0 ]]; then
+  log "Panel requested a reinstall of the current pack (world is kept)."
+  need_reinstall=1
+fi
+
+# A world can only be restored under the pack it was made with.
+if [[ "$BB_REQ_ACTION" == "restore_world" ]]; then
+  _arch_key="$(bb_world_meta "$BB_REQ_ARCHIVE_ID" '.pack.key // empty' || true)"
+  if [[ -n "$_arch_key" && "$(bb_key_identity "$_arch_key")" != "$(bb_key_identity "$desired_key")" ]]; then
+    bb_warn_status "World '${BB_REQ_ARCHIVE_ID}' belongs to ${_arch_key%::*}, but the server is set to ${desired_key%::*}. Set the server to that pack before restoring. Nothing was changed."
+    BB_REQ_ACTION=""
+  fi
+  unset _arch_key
+fi
+
+# WIPE_WORLD is now one-shot: it archives the world once, then ignores itself
+# until it has been set back to 0 (so forgetting to reset it can't eat worlds).
+WIPE_ONESHOT=0
+if [[ "${WIPE_WORLD:-0}" == "1" || "${WIPE_WORLD:-0}" == "true" ]]; then
+  if [[ -f .bb_wipe_consumed ]]; then
+    log "WIPE_WORLD is still 1 but was already applied — ignoring. Set it back to 0."
+  else
+    WIPE_ONESHOT=1
+  fi
+else
+  rm -f .bb_wipe_consumed 2>/dev/null || true
+fi
+
+is_standalone() {
+  case "${1:-}" in vanilla|paper|fabric|quilt|forge|neoforge) return 0 ;; *) return 1 ;; esac
+}
+CURRENT_PROVIDER="${current_key%%::*}"
+[[ "$current_key" == "<none>" ]] && CURRENT_PROVIDER=""
+
+# What kind of run is this? (shown in the panel)
+if   [[ "$IS_SWITCH" -eq 1 ]];                    then BB_RUN_KIND="switch"
+elif [[ -n "$BB_REQ_ACTION" && "$BB_REQ_ACTION" != "switch" ]]; then BB_RUN_KIND="$BB_REQ_ACTION"
+elif [[ "$WIPE_ONESHOT" -eq 1 ]];                 then BB_RUN_KIND="new_world"
+elif [[ "$need_reinstall" -eq 1 && -z "$CURRENT_PROVIDER" ]]; then BB_RUN_KIND="install"
+elif [[ "$need_reinstall" -eq 1 ]];               then BB_RUN_KIND="update"
+else BB_RUN_KIND="boot"
+fi
+export BB_RUN_KIND
+log "Run kind: ${BB_RUN_KIND}"
 
 # ---------------------------------------
 # Main flow
+# 1. Put the current world somewhere safe
+# ---------------------------------------
+WORLD_ARCHIVE_ID=""
+_archive_reason=""
+if   [[ "$BB_REQ_ACTION" == "restore_world" ]]; then _archive_reason="replaced"
+elif [[ "$IS_SWITCH" -eq 1 ]];                  then _archive_reason="switch"
+elif [[ "$BB_REQ_ACTION" == "new_world" || "$WIPE_ONESHOT" -eq 1 ]]; then _archive_reason="new_world"
+fi
+
+if [[ -n "$_archive_reason" ]]; then
+  _extras=()
+  # Leaving a standalone server type: its mods/plugins/config belong with that world.
+  if [[ "$IS_SWITCH" -eq 1 ]] && is_standalone "$CURRENT_PROVIDER"; then
+    for _d in mods plugins config; do [[ -d "$_d" ]] && _extras+=("$_d"); done
+  fi
+  bb_status archiving "Saving your current world"
+  bb_world_archive "$_archive_reason" move "${_extras[@]}"
+  WORLD_ARCHIVE_ID="$BB_LAST_ARCHIVE_ID"
+  unset _extras _d
+elif [[ "$need_reinstall" -eq 1 && -n "$CURRENT_PROVIDER" && "${BB_PREUPDATE_BACKUP:-1}" != "0" && "${BB_BACKUP_KEEP:-2}" != "0" ]]; then
+  bb_status backing_up "Backing up your world before updating"
+  if bb_world_archive pre_update copy; then
+    bb_world_prune pre_update "${BB_BACKUP_KEEP:-2}"
+  else
+    bb_warn_status "Could not back up the world before updating (low disk?). Continuing with the update."
+  fi
+fi
+
+# ---------------------------------------
+# 2. (Re)install, with automatic rollback on failure
 # ---------------------------------------
 if [[ "$need_reinstall" -eq 1 ]]; then
-  deep_wipe
-  run_installer
+  _scope="full"
+  if is_standalone "$PROVIDER" && [[ "$IS_SWITCH" -eq 0 && -n "$CURRENT_PROVIDER" ]]; then
+    _scope="light"   # Paper/Fabric/etc. version bump: keep mods/, plugins/, config/ in place
+  fi
+  bb_status installing "Preparing install"
+  if ! bb_stash_install "$_scope"; then
+    bb_status failed "Could not prepare the install" "" "" "stash failed"
+    exit 1
+  fi
+
+  # Run the installer in a subshell WITH errexit, so any failing command aborts it
+  # (errexit is ignored inside if/&&/|| contexts, hence the explicit set +e/-e dance).
+  set +e
+  ( set -e; run_installer )
+  _rc=$?
+  set -e
+
+  if [[ "$_rc" -ne 0 ]]; then
+    err "Install failed (exit ${_rc})."
+    bb_stash_rollback
+    if [[ -n "$WORLD_ARCHIVE_ID" ]]; then
+      bb_world_restore "$WORLD_ARCHIVE_ID" || warn "Could not move the archived world back automatically: ${WORLD_ARCHIVE_ID}"
+    fi
+    BB_ROLLED_BACK=1; export BB_ROLLED_BACK
+    if [[ -z "$CURRENT_PROVIDER" ]]; then
+      bb_status failed "Install failed" "" "" "The installer exited with code ${_rc}. Check the console for details."
+      exit "$_rc"
+    fi
+    # There was a working server before this — boot it instead of leaving the customer offline.
+    bb_status failed "Install failed — your previous server was restored and is starting" "" "" \
+      "The installer exited with code ${_rc}. Check the console for details."
+    # Describe what is actually running again (the lock is unchanged).
+    PROVIDER="$CURRENT_PROVIDER"; export PROVIDER
+    if [[ "$current_key" =~ ^[^:]+::([^:]*)::(.*)$ ]]; then
+      case "$PROVIDER" in
+        vanilla|paper|fabric|quilt|forge|neoforge|bedrock) : ;;
+        *) PACK_ID_NORM="${BASH_REMATCH[1]}"; VERSION_ID_NORM="${BASH_REMATCH[2]}"
+           RESOLVED_VERSION_ID="${BASH_REMATCH[2]}"; export PACK_ID_NORM VERSION_ID_NORM ;;
+      esac
+    fi
+    need_reinstall=0
+    BB_INSTALL_FAILED=1
+    BB_REQ_ACTION=""; BB_REQ_LEVEL_NAME=""; WIPE_ONESHOT=0
+  else
+    bb_status finalizing "Finishing up"
   # After CurseForge install, store the resolved file ID so future restarts
   # don't re-download when VERSION_ID=latest and the pack hasn't changed
+  if [[ "${PROVIDER:-}" == "curseforge" && -s ".bb_resolved_file_id" ]]; then
+    CF_FILE_ID="$(tr -d '[:space:]' < .bb_resolved_file_id)"
+  fi
   if [[ "${PROVIDER:-}" == "curseforge" && -n "${CF_FILE_ID:-}" && "${CF_FILE_ID}" != "latest" ]]; then
     echo "${CF_FILE_ID}" > ".bb_resolved_file_id"
     RESOLVED_VERSION_ID="${CF_FILE_ID}"
@@ -1998,11 +1956,16 @@ if [[ "$need_reinstall" -eq 1 ]]; then
     echo "${VERSION_ID_NORM}" > ".bb_resolved_mr_version"
     desired_key="modrinth::${PACK_ID_NORM:-}::${VERSION_ID_NORM}"
     log "Stored resolved Modrinth version ID: ${VERSION_ID_NORM}"
+  elif [[ "${PROVIDER:-}" == "modrinth" && -s ".bb_resolved_mr_version" ]]; then
+    # modrinth_install.sh records the exact version it installed
+    _mr_installed="$(tr -d '[:space:]' < .bb_resolved_mr_version)"
+    desired_key="modrinth::${PACK_ID_NORM:-}::${_mr_installed}"
+    log "Stored resolved Modrinth version ID (from installer): ${_mr_installed}"
   elif [[ "${PROVIDER:-}" == "modrinth" ]]; then
     # VERSION_ID_NORM was "latest" — resolve and store what was actually installed
-    _mr_installed="$(curl -fsSL --retry 2 --max-time 10 \
+    _mr_installed="$(curl -fsSL -A "$BB_UA" --retry 2 --max-time 10 \
       "https://api.modrinth.com/v2/project/${PACK_ID_NORM:-}/version" 2>/dev/null \
-      | jq -r 'sort_by(.date_published) | reverse | .[0].id // empty' 2>/dev/null | tr -d '[:space:]' || true)"
+      | jq -r "$MR_LATEST_JQ" 2>/dev/null | tr -d '[:space:]' || true)"
     if [[ -n "$_mr_installed" && "$_mr_installed" != "null" ]]; then
       echo "$_mr_installed" > ".bb_resolved_mr_version"
       # CRITICAL: also rewrite desired_key so the lock stores the real ID, not "latest".
@@ -2031,9 +1994,42 @@ if [[ "$need_reinstall" -eq 1 ]]; then
     fi
   fi
 
-  echo "$desired_key" > "$LOCK_FILE"
-  log "Install complete. Lock updated."
+    if [[ "$IS_SWITCH" -eq 1 || -z "$CURRENT_PROVIDER" ]]; then
+      bb_stash_commit switch
+    else
+      bb_stash_commit update
+    fi
+    echo "$desired_key" > "$LOCK_FILE"
+    log "Install complete. Lock updated."
+  fi
+  unset _scope _rc
 fi
+
+# ---------------------------------------
+# 3. World restore / new world naming
+# ---------------------------------------
+if [[ "$BB_REQ_ACTION" == "restore_world" ]]; then
+  bb_status restoring "Restoring your saved world"
+  if ! bb_world_restore "$BB_REQ_ARCHIVE_ID"; then
+    bb_warn_status "Could not restore world '${BB_REQ_ARCHIVE_ID}'."
+  fi
+elif [[ -n "$_archive_reason" && -z "${BB_INSTALL_FAILED:-}" ]]; then
+  # A fresh world is about to be generated.
+  if [[ -n "$BB_REQ_LEVEL_NAME" && "${PROVIDER:-}" != "bedrock" ]]; then
+    bb_prop_set level-name "$BB_REQ_LEVEL_NAME"
+    printf '%s' "$BB_REQ_LABEL" > .bb_world_label
+    log "New world will be named '${BB_REQ_LABEL}' (folder: ${BB_REQ_LEVEL_NAME})"
+    [[ -d "$BB_REQ_LEVEL_NAME" ]] && bb_warn_status "A folder named '${BB_REQ_LEVEL_NAME}' already exists and will be loaded as the world."
+  else
+    rm -f .bb_world_label
+  fi
+fi
+[[ "$WIPE_ONESHOT" -eq 1 ]] && touch .bb_wipe_consumed
+if [[ -n "$_archive_reason" ]]; then
+  for _r in switch new_world replaced; do bb_world_prune "$_r" "${BB_WORLD_ARCHIVE_KEEP:-5}"; done
+  unset _r
+fi
+unset _archive_reason
 
 MC_VER="$(detect_mc_version)"
 LOADER="$(detect_loader)"
@@ -2060,6 +2056,13 @@ write_pack_info() {
   if [[ -z "$pack_name" && -f "./version.json" ]]; then
     pack_name="$(jq -r '(.name // .pack.name) // empty' version.json 2>/dev/null | tr -d '\r\n')" || pack_name=""
     pack_version="$(jq -r '(.version // .pack.version) // empty' version.json 2>/dev/null | tr -d '\r\n')" || pack_version=""
+  fi
+
+  # Keep what the installer recorded (e.g. curseforge_install.sh knows the pack name
+  # even for server packs with no manifest.json) instead of blanking it every boot.
+  if [[ -z "$pack_name" && -f ".bb_pack_info.json" ]]; then
+    pack_name="$(jq -r '.pack_name // empty' .bb_pack_info.json 2>/dev/null | tr -d '\r\n')" || pack_name=""
+    [[ -z "$pack_version" ]] && { pack_version="$(jq -r '.pack_version // empty' .bb_pack_info.json 2>/dev/null | tr -d '\r\n')" || pack_version=""; }
   fi
 
   # Standalone server types — use a friendly label if no pack name found
@@ -2100,31 +2103,6 @@ write_pack_info() {
 }
 write_pack_info
 
-# ---------------------------------------
-# WIPE_WORLD — delete world folder(s) then warn user to reset it
-# ---------------------------------------
-if [[ "${WIPE_WORLD:-0}" == "1" || "${WIPE_WORLD:-0}" == "true" || "${AUTO_WIPE_WORLD_ON_SWITCH:-0}" == "1" ]]; then
-  if [[ "${AUTO_WIPE_WORLD_ON_SWITCH:-0}" == "1" ]]; then
-    log "Auto-wipe (modpack switch) — deleting world folder(s)..."
-  else
-    log "WIPE_WORLD=1 — deleting world folder(s)..."
-  fi
-  LEVEL_NAME="world"
-  if [[ -f "./server.properties" ]]; then
-    _ln="$(grep -E '^level-name\s*=' ./server.properties 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')" || true
-    [[ -n "${_ln:-}" ]] && LEVEL_NAME="$_ln"
-  fi
-  for _wdir in "$LEVEL_NAME" "${LEVEL_NAME}_nether" "${LEVEL_NAME}_the_end" "world" "world_nether" "world_the_end"; do
-    if [[ -d "./$_wdir" ]]; then
-      rm -rf "./$_wdir"
-      log "  Deleted: $_wdir"
-    fi
-  done
-  log "World wipe complete. A new world will generate on next startup."
-  if [[ "${AUTO_WIPE_WORLD_ON_SWITCH:-0}" != "1" ]]; then
-    log "⚠ Set WIPE_WORLD back to 0 in startup variables to avoid wiping again on the next restart."
-  fi
-fi
 # ---------------------------------------
 # server-port patch — writes SERVER_PORT into server.properties every boot.
 # Pterodactyl sets SERVER_PORT. We patch it here so switching modpacks (which
@@ -2208,34 +2186,7 @@ if [[ "${CLEAN_CLIENT_MODS:-true}" == "true" || "${CLEAN_CLIENT_MODS:-true}" == 
       ;;
   esac
 else
-  log "CLEAN_CLIENT_MODS not set — skipping client mod cleaner. Set to 'true' in startup vars to enable."
+  log "CLEAN_CLIENT_MODS=${CLEAN_CLIENT_MODS:-} — client mod cleaner disabled."
 fi
-
-# ---------------------------------------
-# Crash log trap — on unexpected exit, save last lines of log to .bb_last_crash.log
-# ---------------------------------------
-BB_CRASH_LOG=".bb_last_crash.log"
-_bb_on_exit() {
-  local rc=$?
-  if [[ $rc -ne 0 ]]; then
-    {
-      echo "=== BlazingBlue crash log ==="
-      echo "Exit code: $rc"
-      echo "Time: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-      echo "Provider: ${PROVIDER:-unknown}"
-      echo "MC Version: ${MC_VER:-unknown}"
-      echo "Loader: ${LOADER:-unknown}"
-      echo ""
-      echo "=== Last 60 lines of latest.log ==="
-      if [[ -f "./logs/latest.log" ]]; then
-        tail -n 60 "./logs/latest.log"
-      else
-        echo "(logs/latest.log not found)"
-      fi
-    } > "$BB_CRASH_LOG" 2>/dev/null || true
-    log "Server exited with code $rc. Crash info saved to $BB_CRASH_LOG"
-  fi
-}
-trap '_bb_on_exit' EXIT
 
 start_server "$MC_VER" "$LOADER"
