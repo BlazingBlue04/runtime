@@ -42,7 +42,9 @@ For standalone types (`vanilla|paper|fabric|quilt|forge|neoforge`), set `MC_VERS
 (`Prominence_II`). The old world is **archived, never deleted**.
 
 ### Update (same pack, new version)
-Set `VERSION_ID` only. No request file is needed. The world is kept and a
+Set `VERSION_ID` only. No request file is needed.
+
+**Downgrades** (a lower `MC_VERSION` on Paper, Fabric, vanilla and the other standalone types) are allowed. Old Minecraft versions usually can't read a newer world, so the panel should show a confirm before saving it: "Older versions usually can't load your current world. We'll back it up first." The runtime always takes the `pre_update` backup on a downgrade, even if backups are turned off, and adds a warning to the status. The world is kept and a
 `pre_update` copy is saved first.
 
 ### New world (same pack)
@@ -215,7 +217,7 @@ export interface BBWorldArchive {
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RUNTIME_REF` | `v2.0.1` | git ref the runtime is pulled from |
+| `RUNTIME_REF` | `v2.0.4` | git ref the runtime is pulled from |
 | `BB_WORLD_ARCHIVE_KEEP` | 5 | archives kept per reason |
 | `BB_BACKUP_KEEP` | 2 | pre-update backups kept (0 = no backups) |
 | `BB_ALLOW_MISSING_MODS` | 0 | 1 = finish a CurseForge install even if some mods failed to download |

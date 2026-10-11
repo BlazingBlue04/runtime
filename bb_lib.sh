@@ -19,7 +19,7 @@
 [[ -n "${__BB_LIB_LOADED:-}" ]] && return 0
 __BB_LIB_LOADED=1
 
-BB_LIB_VERSION="2.0.1"
+BB_LIB_VERSION="2.0.4"
 BB_DIR="${BB_DIR:-${SERVER_DIR:-/home/container}}"
 BB_UA="${BB_UA:-BlazingBlue-runtime/${BB_LIB_VERSION} (support@blazingblue.org)}"
 
@@ -621,7 +621,7 @@ _bb_keep_list() {
     "$BB_STASH_DIR" "$BB_WORLDS_DIR" "$BB_WORLDS_INDEX" \
     "$BB_STATUS_FILE" .bb_request.json .bb_request.last.json \
     .bb_runtime_version .bb_last_crash.log .bb_wipe_consumed .bb_world_label \
-    "$BB_WARN_FILE" \
+    "$BB_WARN_FILE" .bb_pack_datapacks.txt \
     .modpack.lock eula.txt \
     backups archives world-backups .bb_backups \
     "${BB_RUNTIME_FILES[@]}"

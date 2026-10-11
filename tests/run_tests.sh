@@ -33,15 +33,18 @@ BIN="${WORK}/bin"; mkdir -p "$BIN"
 SRV="${WORK}/served"; mkdir -p "$SRV"
 cat > "${BIN}/curl" <<'EOF'
 #!/usr/bin/env bash
-out="" url=""
+out="" url="" wfmt=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
-    -A|-H|-w|-X|--max-time|--retry|--retry-delay|--connect-timeout|--user-agent) shift 2 ;;
+    -w) wfmt="$2"; shift 2 ;;
+    -A|-H|-X|-d|--max-time|--retry|--retry-delay|--connect-timeout|--user-agent) shift 2 ;;
     http://*|https://*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
+# Real curl refuses URLs containing raw spaces (exit 3) without sending anything.
+if [[ "$url" == *" "* ]]; then [[ -n "$wfmt" ]] && printf 000; exit 3; fi
 if [[ -n "${FAKE_CURL_FAIL:-}" && "$url" == *"${FAKE_CURL_FAIL}"* ]]; then exit 22; fi
 f=""
 case "$url" in
@@ -55,12 +58,54 @@ case "$url" in
   *cdn.modrinth.com/*/moda.jar)        f="${FAKE_SRV}/moda.jar" ;;
   *minecraft-services.net/api/v1.0/download/links) f="${FAKE_SRV}/bedrock-links.json" ;;
   *bin-linux/bedrock-server-*.zip)     f="${FAKE_SRV}/bedrock.zip" ;;
+  */v1/mods)                            f="${FAKE_SRV}/cf-classes.json" ;;
+  */v1/mods/999)                        f="${FAKE_SRV}/cf-mod.json" ;;
+  */v1/mods/999/files/5000)             f="${FAKE_SRV}/cf-file.json" ;;
+  */v1/mods/*/files/*/download-url)     p="${url#*/v1/mods/}"; f="${FAKE_SRV}/cf-dl-${p%%/*}.json" ;;
+  *edge.forgecdn.net/files/5000/0/TestPack.zip) f="${FAKE_SRV}/cf-pack.zip" ;;
+  *edge.forgecdn.net/files/*)           f="${FAKE_SRV}/moda.jar" ;;
+  *maven.neoforged.net/*.jar)           f="${FAKE_SRV}/fake-installer.jar" ;;
 esac
 [[ -n "$f" && -f "$f" ]] || { echo "fake curl: no fixture for $url" >&2; exit 22; }
 echo "$url" >> "${FAKE_SRV}/requests.log"
 if [[ -n "$out" ]]; then cp "$f" "$out"; else cat "$f"; fi
+[[ -n "$wfmt" ]] && printf 200
+exit 0
 EOF
 chmod +x "${BIN}/curl"
+# wget -> fake curl (curseforge_install.sh uses wget for some calls)
+cat > "${BIN}/wget" <<'EOF'
+#!/usr/bin/env bash
+out="-" url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -qO|-O) out="$2"; shift 2 ;;
+    -qO-) out="-"; shift ;;
+    http://*|https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+if [[ "$out" == "-" ]]; then exec curl -sL "$url"; else exec curl -sL -o "$out" "$url"; fi
+EOF
+chmod +x "${BIN}/wget"
+
+# CurseForge client pack: a mod whose download URL has raw spaces, a resource pack,
+# a data pack. Manifest says NeoForge 21.1.77 on 1.21.1.
+CFB="${WORK}/cfbuild"; mkdir -p "${CFB}/overrides/config"
+echo "pack cfg" > "${CFB}/overrides/config/pack.cfg"
+cat > "${CFB}/manifest.json" <<'J'
+{"minecraft":{"version":"1.21.1","modLoaders":[{"id":"neoforge-21.1.77","primary":true}]},
+ "manifestType":"minecraftModpack","name":"Test CF Pack","version":"1.0",
+ "files":[{"projectID":1,"fileID":11,"required":true},{"projectID":2,"fileID":22,"required":true},{"projectID":3,"fileID":33,"required":true}],
+ "overrides":"overrides"}
+J
+(cd "$CFB" && zip -qr "${SRV}/cf-pack.zip" .)
+echo '{"data":{"id":999,"name":"Test CF Pack","mainFileId":5000}}' > "${SRV}/cf-mod.json"
+echo '{"data":{"id":5000,"isServerPack":false,"serverPackFileId":null,"downloadUrl":"https://edge.forgecdn.net/files/5000/0/TestPack.zip"}}' > "${SRV}/cf-file.json"
+echo '{"data":[{"id":1,"classId":6},{"id":2,"classId":12},{"id":3,"classId":6945}]}' > "${SRV}/cf-classes.json"
+echo '{"data":"https://edge.forgecdn.net/files/11/1/create_sky_village-0.0.38 NeoForge 1.21.1.jar"}' > "${SRV}/cf-dl-1.json"
+echo '{"data":"https://edge.forgecdn.net/files/22/2/Excalibur Amendments 1.7.zip"}' > "${SRV}/cf-dl-2.json"
+echo '{"data":"https://edge.forgecdn.net/files/33/3/Cool Datapack [1.21].zip"}' > "${SRV}/cf-dl-3.json"
 
 # --- fixtures ---------------------------------------------------------------
 head -c 200000 /dev/zero > "${SRV}/big.jar"
@@ -284,22 +329,32 @@ for v in 2 3 4 5; do mkworld world "w$v"; boot "${CF[@]}" PACK_ID=111 VERSION_ID
 check "only 2 pre_update backups kept"       jqt "$S/.bb_worlds.json" '[.archives[]|select(.reason=="pre_update")]|length==2'
 
 # =============================================================================
-t "15. Paper: latest resolves via Fill v3, version bump keeps plugins"
+t "15. Paper: version bump keeps plugins/world; latest via Fill v3; downgrade warns + backs up"
 new_server paper
-boot PACK_PROVIDER=paper MC_VERSION=latest
+boot PACK_PROVIDER=paper MC_VERSION=1.20.6
 check "boot succeeded"                       test "$RC" -eq 0
-check "resolved newest stable (1.21.4 b50)"  has "$SRV/requests.log" "paper-1.21.4-50.jar"
-check "install meta written"                 jqt "$S/.bb_install_meta.json" '.loader=="paper" and .mc_version=="1.21.4"'
 mkdir -p "$S/plugins/Essentials"; echo cfg > "$S/plugins/Essentials/config.yml"
 mkworld world "paper-world"
-boot PACK_PROVIDER=paper MC_VERSION=1.20.6
-check "MC bump is an update, not a switch"   jqt "$S/.bb_install_status.json" '.kind=="update"'
+boot PACK_PROVIDER=paper MC_VERSION=latest
+check "upgrade is an update, not a switch"   jqt "$S/.bb_install_status.json" '.kind=="update"'
+check "resolved newest stable (1.21.4 b50)"  has "$SRV/requests.log" "paper-1.21.4-50.jar"
+check "install meta written"                 jqt "$S/.bb_install_meta.json" '.loader=="paper" and .mc_version=="1.21.4"'
 check "plugins untouched"                    test -f "$S/plugins/Essentials/config.yml"
 check "world untouched"                      has "$S/world/level.dat" "paper-world"
+N_BEFORE="$(jq '[.archives[]|select(.reason=="pre_update")]|length' "$S/.bb_worlds.json")"
+boot PACK_PROVIDER=paper MC_VERSION=1.20.6
+check "downgrade goes through"               jqt "$S/.bb_install_meta.json" '.mc_version=="1.20.6"'
+check "downgrade warning shown"              jqt "$S/.bb_install_status.json" '.warnings|map(test("Downgraded from Minecraft 1.21.4 to 1.20.6"))|any'
+check "1.21.4 world backed up first"         jqt "$S/.bb_worlds.json" '[.archives[]|select(.reason=="pre_update" and .pack.mc_version=="1.21.4")]|length>=1'
+check "plugins kept"                         test -f "$S/plugins/Essentials/config.yml"
+echo '{"id":"r","action":"new_world"}' > "$S/.bb_request.json"
+boot PACK_PROVIDER=paper MC_VERSION=1.20.6
+check "new world archives the old one"       jqt "$S/.bb_worlds.json" '[.archives[]|select(.reason=="new_world")]|length==1'
+boot PACK_PROVIDER=paper MC_VERSION=1.21.4
 check "Java 21 picked for 1.20.6"            bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.20.6) == 21 ]]"
 
 t "16. Paper install failure (API down) keeps the old server"
-boot PACK_PROVIDER=paper MC_VERSION=1.21.4 FAKE_CURL_FAIL=fill-data
+boot PACK_PROVIDER=paper MC_VERSION=latest FAKE_CURL_FAIL=fill-data
 check "rolled back"                          jqt "$S/.bb_install_status.json" '.rolled_back==true'
 check "old jar still there"                  test -f "$S/server.jar"
 check "plugins still there"                  test -f "$S/plugins/Essentials/config.yml"
@@ -368,6 +423,18 @@ check "Java 25 selected for it"              bash -c "source '$ROOT/bb_lib.sh'; 
 
 t "24. RUNTIME_REF picks the download source without the startup command's help"
 check "ref used when RUNTIME_RAW_BASE unset" bash -c "grep -q 'runtime/\${RUNTIME_REF:-main}}' '$ROOT/switch_modpack.sh'"
+
+t "25. Real CurseForge installer: spaced URLs, resource packs skipped, datapacks placed"
+new_server cf-real
+cp "$ROOT/curseforge_install.sh" "$S/curseforge_install.sh"
+boot PACK_PROVIDER=curseforge PACK_ID=999 VERSION_ID=5000
+check "boot succeeded"                       test "$RC" -eq 0
+check "mod with spaces in URL downloaded"    test -f "$S/mods/create_sky_village-0.0.38 NeoForge 1.21.1.jar"
+check "resource pack not downloaded"         bash -c "! ls -R '$S/mods/' | grep -q Excalibur"
+check "datapack placed in world/datapacks"   test -f "$S/world/datapacks/Cool Datapack [1.21].zip"
+check "overrides applied"                    test -f "$S/config/pack.cfg"
+check "NeoForge installed (run.sh)"          test -f "$S/run.sh"
+check "lock written"                         has "$S/.modpack.lock" "curseforge::999::5000"
 
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
