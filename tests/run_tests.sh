@@ -550,6 +550,39 @@ C
   cf_resolve_latest_file_id 1118358')"
 check "newest file id found across pages (1169)" test "$RES" = "1169"
 
+t "30. Cleaner learns client-only mods from the last crash"
+new_server cleaner-crash
+mkdir -p "$S/mods" "$S/logs" "$WORK/jars/rdi/META-INF" "$WORK/jars/dfr/META-INF"
+printf 'modLoader="javafml"\n[[mods]]\nmodId="retrodamageindicators"\n' > "$WORK/jars/rdi/META-INF/neoforge.mods.toml"
+printf 'modLoader="javafml"\n[[mods]]\nmodId="distraction_free_recipes"\n' > "$WORK/jars/dfr/META-INF/neoforge.mods.toml"
+(cd "$WORK/jars/rdi"  && zip -qr "$S/mods/retrodamageindicators-1.0.jar" .)
+(cd "$WORK/jars/dfr"  && zip -qr "$S/mods/distraction_free_recipes-2.0.jar" .)
+(cd "$WORK/jars/more" && zip -qr "$S/mods/simplymore-1.0.jar" .)
+(cd "$WORK/jars/tip"  && zip -qr "$S/mods/simplytooltips-0.1.3.jar" .)
+echo '{}' > "$SRV/mr-vf.json"
+cat > "$S/logs/latest.log" <<'L'
+[main/ERROR] [net.neoforged.fml.common.asm.RuntimeDistCleaner/DISTXFORM]: Attempted to load class net/minecraft/client/Minecraft for invalid dist DEDICATED_SERVER
+[main/ERROR] [net.minecraft.server.Main/FATAL]: Failed to start the minecraft server
+net.neoforged.fml.ModLoadingException: Loading errors encountered:
+	- ReRetro Damage Indicators (retrodamageindicators) has failed to load correctly
+	  java.lang.NoClassDefFoundError: net/minecraft/client/renderer/MultiBufferSource
+	- Distraction Free Recipes (EMI) (distraction_free_recipes) has failed to load correctly
+	  java.lang.BootstrapMethodError: java.lang.RuntimeException: Attempted to load class net/minecraft/client/gui/screens/Screen for invalid dist DEDICATED_SERVER
+	- Simply More (simplymore) has failed to load correctly
+	  java.lang.NullPointerException: some unrelated bug
+L
+env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" SERVER_DIR="$S" \
+  bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner6.log" 2>&1; LAST_LOG="$WORK/cleaner6.log"
+check "damage indicators disabled"           test -f "$S/mods_disabled/retrodamageindicators-1.0.jar"
+check "EMI add-on disabled"                  test -f "$S/mods_disabled/distraction_free_recipes-2.0.jar"
+check "non-client crash left alone"          test -f "$S/mods/simplymore-1.0.jar"
+check "learned list saved"                   has "$S/.bb_cleaner_learned.txt" "retrodamageindicators"
+check "warning for the panel"                has "$S/.bb_install_warnings" "retrodamageindicators"
+: > "$S/logs/latest.log"
+env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" SERVER_DIR="$S" \
+  bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner7.log" 2>&1; LAST_LOG="$WORK/cleaner7.log"
+check "stays disabled after a clean log"     test -f "$S/mods_disabled/retrodamageindicators-1.0.jar"
+
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
 check "1.18.2 -> 17"  bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.18.2) == 17 ]]"

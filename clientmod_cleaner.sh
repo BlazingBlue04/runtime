@@ -7,6 +7,7 @@
 #   0b. BB_KEEP_MODS                 — admin allowlist, never disabled
 #   1. Modrinth lookup (by sha1)     — project says server_side "unsupported"
 #   2. CLIENT_ONLY_PATTERNS          — filename fallback for mods not on Modrinth
+#   3. Learned from crashes          — mods the last start named as loading client-only code
 #   (jar metadata below is only used with BB_TRUST_METADATA=1)
 #
 # Jar metadata checks (opt-in):
@@ -507,6 +508,58 @@ for name in "${!LOC[@]}"; do
 done
 printf '%s\n' "${NEW_CACHE[@]}" > "$CACHE_FILE" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Pass 1b: learn from the last crash.
+# Some client-only mods aren't on Modrinth (or aren't flagged there). When one
+# breaks the server, NeoForge/Forge names it:
+#   - ReRetro Damage Indicators (retrodamageindicators) has failed to load correctly
+#     java.lang.NoClassDefFoundError: net/minecraft/client/renderer/MultiBufferSource
+# If the error shows it touched client-only code, remember that mod id for good
+# (.bb_cleaner_learned.txt) and disable it. Only the "Loading errors" block is
+# read, not the harmless mixin warnings about client classes.
+# ---------------------------------------------------------------------------
+LEARNED_FILE="$DIR/.bb_cleaner_learned.txt"
+declare -A LEARNED=()
+if [[ -f "$LEARNED_FILE" ]]; then
+  while IFS= read -r _id; do [[ -n "$_id" ]] && LEARNED["$_id"]=1; done < "$LEARNED_FILE"
+fi
+NEW_LEARNED=()
+if [[ -f "$DIR/logs/latest.log" ]]; then
+  while IFS= read -r _id; do
+    [[ -n "$_id" && -z "${LEARNED[$_id]:-}" ]] || continue
+    LEARNED["$_id"]=1; NEW_LEARNED+=("$_id")
+  done < <(awk '
+    /has failed to load correctly/ {
+      id = ""
+      if (match($0, /\(([A-Za-z0-9_.-]+)\) has failed to load correctly/)) {
+        id = substr($0, RSTART + 1, RLENGTH - 1); sub(/\).*/, "", id)
+      }
+      pending = id; next
+    }
+    pending != "" {
+      if ($0 ~ /net\/minecraft\/client\/|net\.minecraft\.client\.|invalid dist DEDICATED_SERVER|com\/mojang\/blaze3d\/|com\.mojang\.blaze3d\./) print pending
+      pending = ""
+    }' "$DIR/logs/latest.log" | sort -u)
+fi
+if (( ${#NEW_LEARNED[@]} )); then
+  printf '%s\n' "${NEW_LEARNED[@]}" >> "$LEARNED_FILE"
+  log "Last start crashed on client-only code in: ${NEW_LEARNED[*]} — disabling from now on."
+  printf '%s\n' "Disabled mod(s) that crashed the server by loading client-only code: ${NEW_LEARNED[*]}" \
+    >> "$DIR/.bb_install_warnings" 2>/dev/null || true
+fi
+crash_removed=0
+if (( ${#LEARNED[@]} )); then
+  for name in "${!LOC[@]}"; do
+    matches_keep "$name" && continue
+    for _id in ${IDS_OF[$name]}; do
+      if [[ -n "${LEARNED[$_id]:-}" ]]; then
+        REASON["$name"]="crashed the server loading client-only code ($_id)"; KIND["$name"]=crash
+        break
+      fi
+    done
+  done
+fi
+
 declare -A KEPT_BECAUSE=()
 while :; do
   declare -A NEEDED_BY=()
@@ -539,6 +592,7 @@ for name in "${!LOC[@]}"; do
     echo "$name" >> "${OURS_FILE}.new"
     case "${KIND[$name]}" in
       modrinth) ((modrinth_removed++)) || true ;;
+      crash)    ((crash_removed++)) || true ;;
       metadata) ((metadata_removed++)) || true ;;
       *)        ((pattern_removed++)) || true ;;
     esac
@@ -577,10 +631,10 @@ done
 echo ""
 if "$DRY_RUN"; then
   log "Dry run complete."
-  log "  Would disable: $moved mod(s)  ($modrinth_removed via Modrinth, $metadata_removed via metadata, $pattern_removed via filename)"
+  log "  Would disable: $moved mod(s)  ($modrinth_removed via Modrinth, $crash_removed learned from crashes, $metadata_removed via metadata, $pattern_removed via filename)"
 else
   log "Done."
-  log "  Disabled: $moved mod(s)  ($modrinth_removed via Modrinth, $metadata_removed via metadata, $pattern_removed via filename)"
+  log "  Disabled: $moved mod(s)  ($modrinth_removed via Modrinth, $crash_removed learned from crashes, $metadata_removed via metadata, $pattern_removed via filename)"
 fi
 [[ "$kept_as_dependency" -gt 0 ]] && log "  Kept because another mod requires them: $kept_as_dependency"
 [[ "$reenabled" -gt 0 ]] && log "  Re-enabled: $reenabled"
