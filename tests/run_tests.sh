@@ -512,6 +512,44 @@ env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" SERVER_DIR="$S" \
   bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner4.log" 2>&1; LAST_LOG="$WORK/cleaner4.log"
 check "stable on the next boot"              test -f "$S/mods/simplytooltips-0.1.3.jar" -a -f "$S/mods_disabled/zoomify-2.14.jar"
 
+t "28. Cleaner first run re-checks everything in mods_disabled (no record left by old versions)"
+new_server cleaner-first
+mkdir -p "$S/mods" "$S/mods_disabled"
+(cd "$WORK/jars/more" && zip -qr "$S/mods/simplymore-1.0.jar" .)
+(cd "$WORK/jars/tip"  && zip -qr "$S/mods_disabled/simplytooltips-0.1.3.jar" .)
+: > "$S/.bb_client_mods.log"      # what an old cleaner leaves after a quiet boot
+: > "$S/.bb_cleaner_disabled.txt"  # and the empty record v2.0.6 wrote
+env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" SERVER_DIR="$S" \
+  bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner5.log" 2>&1; LAST_LOG="$WORK/cleaner5.log"
+check "first run message"                    has "$WORK/cleaner5.log" "First run: re-checking 1"
+check "required mod moved back"              test -f "$S/mods/simplytooltips-0.1.3.jar"
+check "record file written"                  test -f "$S/.bb_cleaner_disabled.txt"
+
+t "29. CurseForge 'latest' check works on packs with many files"
+CFT="$WORK/cfpages"; mkdir -p "$CFT"
+python3 - "$CFT" <<'PY'
+import json, sys
+out = sys.argv[1]
+big = "x" * 4000                     # make each file object ~4 KB, like real CF responses
+files = [{"id": 1000 + i, "isAvailable": True, "fileDate": "2026-%02d-%02dT00:00:00Z" % (1 + i // 28, 1 + i % 28), "pad": big} for i in range(170)]
+files[-1]["fileDate"] = "2026-12-31T00:00:00Z"
+for idx in range(0, 200, 50):
+    json.dump({"data": files[idx:idx + 50]}, open("%s/page-%d.json" % (out, idx), "w"))
+PY
+check "pages are larger than the 128 KB argument limit" test "$(wc -c < "$CFT/page-0.json")" -gt 131072
+RES="$(env -i HOME="$HOME" PATH="$WORK/cfbin:${PATH}" CF_API_KEY=k CFT="$CFT" bash -c '
+  mkdir -p '"$WORK"'/cfbin
+  cat > '"$WORK"'/cfbin/curl <<'"'"'C'"'"'
+#!/usr/bin/env bash
+out="" url=""
+while [[ $# -gt 0 ]]; do case "$1" in -o) out="$2"; shift 2;; -w|-H|--retry|--max-time) shift 2;; http*) url="$1"; shift;; *) shift;; esac; done
+idx="${url##*index=}"; cp "$CFT/page-${idx}.json" "$out" 2>/dev/null || echo "{\"data\":[]}" > "$out"; printf 200
+C
+  chmod +x '"$WORK"'/cfbin/curl
+  eval "$(sed -n "/^cf_resolve_latest_file_id() {/,/^}/p" '"$ROOT"'/switch_modpack.sh)"
+  cf_resolve_latest_file_id 1118358')"
+check "newest file id found across pages (1169)" test "$RES" = "1169"
+
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
 check "1.18.2 -> 17"  bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.18.2) == 17 ]]"

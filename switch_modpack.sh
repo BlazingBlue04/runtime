@@ -493,21 +493,29 @@ fi
 # recently regardless of the author's "default file" setting.
 # -----------------------------
 cf_resolve_latest_file_id() {
-  local pack_id="$1"
-  local all_files="[]" idx=0 page_size=50 page_data count
+  # Pages are reduced to {id,isAvailable,fileDate} and written to a temp file,
+  # then combined once. (The old version passed the growing list to jq as a
+  # command-line argument; past 128 KB — two or three pages of a big pack —
+  # that fails, the list came back empty, and "latest" silently never resolved.)
+  local pack_id="$1" idx=0 page_size=50 count code tmp
+  tmp="$(mktemp -d)"
   while :; do
-    page_data="$(curl -fsSL --retry 2 --max-time 10 \
-      -H "Accept: application/json" \
-      -H "x-api-key: ${CF_API_KEY}" \
-      "https://api.curseforge.com/v1/mods/${pack_id}/files?pageSize=${page_size}&index=${idx}" 2>/dev/null \
-      | jq -c '.data // []' 2>/dev/null)"
-    [[ -z "$page_data" || "$page_data" == "null" ]] && page_data="[]"
-    all_files="$(jq -c -n --argjson a "$all_files" --argjson b "$page_data" '$a + $b' 2>/dev/null)" || all_files="[]"
-    count="$(echo "$page_data" | jq 'length' 2>/dev/null || echo 0)"
+    code="$(curl -sS --retry 2 --max-time 30 -o "$tmp/page.json" -w '%{http_code}' \
+      -H "Accept: application/json" -H "x-api-key: ${CF_API_KEY}" \
+      "https://api.curseforge.com/v1/mods/${pack_id}/files?pageSize=${page_size}&index=${idx}" 2>"$tmp/err")" || code="000"
+    if [[ "$code" != "200" ]]; then
+      echo "[curseforge] file list request failed (HTTP ${code}): $(head -c 200 "$tmp/err" "$tmp/page.json" 2>/dev/null | tr '\n' ' ')" >&2
+      break
+    fi
+    jq -c '[.data[]? | {id, isAvailable, fileDate}]' "$tmp/page.json" > "$tmp/p.${idx}.json" 2>/dev/null || break
+    count="$(jq 'length' "$tmp/p.${idx}.json" 2>/dev/null || echo 0)"
     idx=$((idx + page_size))
-    [[ "$count" -lt "$page_size" || "$idx" -ge 200 ]] && break
+    [[ "$count" -lt "$page_size" || "$idx" -ge 1000 ]] && break
   done
-  echo "$all_files" | jq -r '[.[] | select(.isAvailable == true)] | sort_by(.fileDate) | last | .id // empty' 2>/dev/null
+  if compgen -G "$tmp/p.*.json" >/dev/null; then
+    jq -s -r 'add | [.[] | select(.isAvailable == true)] | sort_by(.fileDate) | last | .id // empty' "$tmp"/p.*.json 2>/dev/null
+  fi
+  rm -rf "$tmp"
 }
 
 # Desired key (include MC_VERSION for vanilla/paper so version changes trigger reinstall)
@@ -542,7 +550,7 @@ if [[ "${PROVIDER:-}" == "curseforge" && "${VERSION_ID_NORM:-latest}" == "latest
         fi
       else
         # API call failed or returned nothing — fall back to stored ID to avoid unnecessary reinstall
-        log "WARN: Could not reach CurseForge API to check for updates — using stored file ID ${_stored_resolved}."
+        log "WARN: Could not get the CurseForge file list to check for updates (see the line above) — using stored file ID ${_stored_resolved}."
         RESOLVED_VERSION_ID="$_stored_resolved"
       fi
     else

@@ -363,13 +363,25 @@ mkdir -p "$DISABLED_DIR"
 # Files this cleaner disabled before (so it may re-enable them). Files a customer
 # moved into mods_disabled/ by hand are never touched.
 OURS_FILE="$DIR/.bb_cleaner_disabled.txt"
-declare -A OURS=()
-if [[ -f "$OURS_FILE" ]]; then
+declare -A OURS=() FIRSTRUN_ONLY=()
+if [[ -s "$OURS_FILE" ]]; then
   while IFS= read -r _n; do [[ -n "$_n" ]] && OURS["$_n"]=1; done < "$OURS_FILE"
+else   # missing, or empty (v2.0.6 wrote an empty one on servers it couldn't read)
+  # First run of this cleaner on this server. Older versions kept no reliable
+  # record (they wiped their log every boot), so everything in mods_disabled/
+  # is looked at once. Without a record we can't tell our disables from a
+  # customer's, so those only come back if a kept mod requires them.
+  for _j in "$DISABLED_DIR"/*.jar; do
+    [[ -f "$_j" ]] || continue
+    OURS["$(basename -- "$_j")"]=1; FIRSTRUN_ONLY["$(basename -- "$_j")"]=1
+  done
+  [[ ${#OURS[@]} -gt 0 ]] && log "First run: re-checking ${#OURS[@]} previously disabled mod(s)."
 fi
 if [[ -f "$LOG_FILE" ]]; then   # cleaner versions before this one only left their log
-  while IFS= read -r _n; do [[ -n "$_n" ]] && OURS["$_n"]=1; done \
-    < <(sed -n 's/^\[cleaner\]   \[disabled\] \(.*\)  (.*$/\1/p' "$LOG_FILE")
+  while IFS= read -r _n; do
+    [[ -n "$_n" ]] || continue
+    OURS["$_n"]=1; unset 'FIRSTRUN_ONLY[$_n]'   # the log proves we disabled it
+  done < <(sed -n 's/^\[cleaner\]   \[disabled\] \(.*\)  (.*$/\1/p' "$LOG_FILE")
 fi
 : > "$LOG_FILE" 2>/dev/null || true
 
@@ -545,6 +557,9 @@ for name in "${!LOC[@]}"; do
     if [[ -n "${KEPT_BECAUSE[$name]:-}" ]]; then
       ((kept_as_dependency++)) || true
       echo "[cleaner]   [kept] $name  (${KEPT_BECAUSE[$name]})" | tee -a "$LOG_FILE"
+    fi
+    if [[ "$jar" == "$DISABLED_DIR/"* && -n "${FIRSTRUN_ONLY[$name]:-}" && -z "${KEPT_BECAUSE[$name]:-}" ]]; then
+      continue   # no record it was ours and nothing needs it: leave the customer's choice alone
     fi
     if [[ "$jar" == "$DISABLED_DIR/"* ]]; then
       ((reenabled++)) || true
