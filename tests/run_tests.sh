@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     -w) wfmt="$2"; shift 2 ;;
-    -A|-H|-X|-d|--max-time|--retry|--retry-delay|--connect-timeout|--user-agent) shift 2 ;;
+    -A|-H|-X|-d|--data-binary|--max-time|--retry|--retry-delay|--connect-timeout|--user-agent) shift 2 ;;
     http://*|https://*) url="$1"; shift ;;
     *) shift ;;
   esac
@@ -58,6 +58,8 @@ case "$url" in
   *cdn.modrinth.com/*/moda.jar)        f="${FAKE_SRV}/moda.jar" ;;
   *minecraft-services.net/api/v1.0/download/links) f="${FAKE_SRV}/bedrock-links.json" ;;
   *bin-linux/bedrock-server-*.zip)     f="${FAKE_SRV}/bedrock.zip" ;;
+  *api.modrinth.com/v2/version_files)   f="${FAKE_SRV}/mr-vf.json" ;;
+  *api.modrinth.com/v2/projects\?ids=*) f="${FAKE_SRV}/mr-projects.json" ;;
   */v1/mods)                            f="${FAKE_SRV}/cf-classes.json" ;;
   */v1/mods/999)                        f="${FAKE_SRV}/cf-mod.json" ;;
   */v1/mods/999/files/5000)             f="${FAKE_SRV}/cf-file.json" ;;
@@ -435,6 +437,33 @@ check "datapack placed in world/datapacks"   test -f "$S/world/datapacks/Cool Da
 check "overrides applied"                    test -f "$S/config/pack.cfg"
 check "NeoForge installed (run.sh)"          test -f "$S/run.sh"
 check "lock written"                         has "$S/.modpack.lock" "curseforge::999::5000"
+
+t "26. Client mod cleaner: Modrinth says client-only, patterns, BB_KEEP_MODS"
+new_server cleaner
+mkdir -p "$S/mods"
+printf 'sodium jar'  > "$S/mods/sodium-neoforge-0.8.13+mc1.21.1.jar"
+printf 'zoomify jar' > "$S/mods/zoomify-2.14.jar"
+printf 'create jar'  > "$S/mods/create-1.21.1-6.0.jar"
+printf 'optifine'    > "$S/mods/OptiFine_1.21.1.jar"
+printf 'xaero'       > "$S/mods/Xaeros_Minimap_25.jar"
+H_SOD="$(sha1sum "$S/mods/sodium-neoforge-0.8.13+mc1.21.1.jar" | cut -d' ' -f1)"
+H_ZOOM="$(sha1sum "$S/mods/zoomify-2.14.jar" | cut -d' ' -f1)"
+H_CREATE="$(sha1sum "$S/mods/create-1.21.1-6.0.jar" | cut -d' ' -f1)"
+printf '{"%s":{"project_id":"AANobbMI"},"%s":{"project_id":"w7ThoJFB"},"%s":{"project_id":"LNytGWDc"}}' \
+  "$H_SOD" "$H_ZOOM" "$H_CREATE" > "$SRV/mr-vf.json"
+echo '[{"id":"AANobbMI","title":"Sodium","server_side":"unsupported"},{"id":"w7ThoJFB","title":"Zoomify","server_side":"unsupported"},{"id":"LNytGWDc","title":"Create","server_side":"required"}]' > "$SRV/mr-projects.json"
+env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" SERVER_DIR="$S" BB_KEEP_MODS="xaeros*" \
+  bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner.log" 2>&1; LAST_LOG="$WORK/cleaner.log"
+check "Sodium disabled (Modrinth)"           test -f "$S/mods_disabled/sodium-neoforge-0.8.13+mc1.21.1.jar"
+check "Zoomify disabled (Modrinth)"          test -f "$S/mods_disabled/zoomify-2.14.jar"
+check "Create kept (server_side required)"   test -f "$S/mods/create-1.21.1-6.0.jar"
+check "OptiFine disabled (pattern)"          test -f "$S/mods_disabled/OptiFine_1.21.1.jar"
+check "Xaero kept by BB_KEEP_MODS"           test -f "$S/mods/Xaeros_Minimap_25.jar"
+check "reason logged"                        has "$WORK/cleaner.log" "Modrinth: Sodium is client-only"
+rm -rf "$S/mods_disabled" "$S/mods"; mkdir -p "$S/mods"; printf 'sodium jar' > "$S/mods/sodium-neoforge-0.8.13+mc1.21.1.jar"
+env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" FAKE_CURL_FAIL=modrinth SERVER_DIR="$S" \
+  bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner2.log" 2>&1; LAST_LOG="$WORK/cleaner2.log"
+check "offline: Sodium still caught by pattern" test -f "$S/mods_disabled/sodium-neoforge-0.8.13+mc1.21.1.jar"
 
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"

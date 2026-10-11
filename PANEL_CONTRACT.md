@@ -217,10 +217,12 @@ export interface BBWorldArchive {
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RUNTIME_REF` | `v2.0.4` | git ref the runtime is pulled from |
+| `RUNTIME_REF` | `v2.0.5` | git ref the runtime is pulled from |
 | `BB_WORLD_ARCHIVE_KEEP` | 5 | archives kept per reason |
 | `BB_BACKUP_KEEP` | 2 | pre-update backups kept (0 = no backups) |
 | `BB_ALLOW_MISSING_MODS` | 0 | 1 = finish a CurseForge install even if some mods failed to download |
 | `BB_CARRY_PROPS` | see `bb_lib.sh` | server.properties keys carried from the old pack on switch |
+| `BB_KEEP_MODS` | empty | comma-separated filename globs the client mod cleaner must never disable (e.g. `xaeros*,appleskin*`) |
+| `BB_MODRINTH_LOOKUP` | 1 | 0 = don't ask Modrinth which mods are client-only (filename patterns only) |
 | `BB_SKIP_SELF_UPDATE` | 0 | 1 = don't pull scripts from GitHub on boot (hotfix one server) |
 | `BB_DRY_START` | 0 | 1 = print the start command instead of launching (debug) |

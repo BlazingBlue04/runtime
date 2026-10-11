@@ -2,7 +2,14 @@
 # =============================================================================
 # clientmod_cleaner.sh — Server-side client mod remover (v2)
 #
-# Detection priority order:
+# Detection order (what actually runs by default):
+#   0. FORCE_DISABLE_PATTERNS        — known crashers, always disabled
+#   0b. BB_KEEP_MODS                 — admin allowlist, never disabled
+#   1. Modrinth lookup (by sha1)     — project says server_side "unsupported"
+#   2. CLIENT_ONLY_PATTERNS          — filename fallback for mods not on Modrinth
+#   (jar metadata below is only used with BB_TRUST_METADATA=1)
+#
+# Jar metadata checks (opt-in):
 #   1. fabric.mod.json  — "environment": "client"       (Fabric/Quilt)
 #   2. quilt.mod.json   — "environment": "client"       (Quilt)
 #   3. META-INF/mods.toml — side = "CLIENT"             (Forge/NeoForge 1.14+)
@@ -48,7 +55,10 @@ jar_cat() {
 
 jar_has() {
   local jar="$1" path="$2"
-  unzip -l "$jar" 2>/dev/null | grep -qF "$path"
+  # unzip -l with a member name exits 0 only if that member exists. (The old
+  # `unzip -l | grep -q` could report "missing" under pipefail when grep closed
+  # the pipe early.)
+  unzip -l "$jar" "$path" >/dev/null 2>&1
 }
 
 # =============================================================================
@@ -183,6 +193,7 @@ detect_mod_environment() {
 # Only for mods with no metadata at all
 # =============================================================================
 CLIENT_ONLY_PATTERNS=(
+  "sodium*"           "reeses*sodium*"    "reeses_sodium*"
   "oculus*"           "embeddium*"        "rubidium*"
   "iris*"             "optifine*"         "optifabric*"
   "EuphoriaPatcher*"  "euphoria_patcher*" "gpumemleakfix*"
@@ -217,6 +228,74 @@ FORCE_DISABLE_PATTERNS=(
   "*RevelationFix*"                       # client-only rendering fix, ships as "[Forge]RevelationFix-*"
   "gtbcs_geomancy_plus*"                  # client-rendering addon for GTBC's Geomancy
 )
+
+# BB_KEEP_MODS: comma-separated filename globs that must never be disabled
+# (escape hatch if Modrinth or a pattern is wrong about a mod).
+matches_keep() {
+  local name_lower="${1,,}" pattern
+  [[ -n "${BB_KEEP_MODS:-}" ]] || return 1
+  IFS=',' read -r -a _keep_pats <<< "${BB_KEEP_MODS}"
+  for pattern in "${_keep_pats[@]}"; do
+    pattern="${pattern#"${pattern%%[![:space:]]*}"}"; pattern="${pattern%"${pattern##*[![:space:]]}"}"
+    [[ -n "$pattern" ]] || continue
+    case "$name_lower" in
+      ${pattern,,}) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# =============================================================================
+# MODRINTH LOOKUP
+# Modrinth stores, per project, whether it runs on a server (server_side:
+# required / optional / unsupported). Look every jar up by sha1 in one request,
+# then fetch the projects in batches. Mods not on Modrinth are simply unknown.
+# Disable with BB_MODRINTH_LOOKUP=0.
+# =============================================================================
+declare -A MR_CLIENT_ONLY=()
+modrinth_lookup() {
+  [[ "${BB_MODRINTH_LOOKUP:-1}" != "0" ]] || { log "Modrinth lookup disabled (BB_MODRINTH_LOOKUP=0)."; return 0; }
+  command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v sha1sum >/dev/null 2>&1 || return 0
+  local ua="${BB_UA:-BlazingBlue-runtime (support@blazingblue.org)}"
+  local tmp; tmp="$(mktemp -d)"
+  ( cd "$MODS_DIR" && sha1sum -- *.jar 2>/dev/null ) | sed 's/  /\t/' > "$tmp/hashes.tsv" || true
+  [[ -s "$tmp/hashes.tsv" ]] || { rm -rf "$tmp"; return 0; }
+
+  cut -f1 "$tmp/hashes.tsv" | jq -R -s -c '{hashes: (split("\n") | map(select(length>0))), algorithm: "sha1"}' > "$tmp/req.json"
+  if ! curl -fsS -A "$ua" --retry 2 --max-time 60 -X POST -H "Content-Type: application/json" \
+        --data-binary @"$tmp/req.json" "https://api.modrinth.com/v2/version_files" -o "$tmp/vf.json" 2>/dev/null; then
+    log "Modrinth lookup unavailable — using filename patterns only."
+    rm -rf "$tmp"; return 0
+  fi
+  # hash -> project_id
+  jq -r 'to_entries[] | "\(.key)\t\(.value.project_id)"' "$tmp/vf.json" 2>/dev/null > "$tmp/h2p.tsv" || true
+  [[ -s "$tmp/h2p.tsv" ]] || { log "Modrinth: none of these jars are on Modrinth."; rm -rf "$tmp"; return 0; }
+
+  # project_id -> server_side, 100 ids per request
+  : > "$tmp/proj.tsv"
+  cut -f2 "$tmp/h2p.tsv" | sort -u > "$tmp/ids.txt"
+  split -l 100 "$tmp/ids.txt" "$tmp/chunk." 2>/dev/null || true
+  local c ids
+  for c in "$tmp"/chunk.*; do
+    [[ -f "$c" ]] || continue
+    ids="$(jq -R -s -c 'split("\n") | map(select(length>0))' "$c" | jq -sRr @uri)"
+    curl -fsS -A "$ua" --retry 2 --max-time 60 "https://api.modrinth.com/v2/projects?ids=${ids}" 2>/dev/null \
+      | jq -r '.[] | "\(.id)\t\(.server_side)\t\(.title)"' 2>/dev/null >> "$tmp/proj.tsv" || true
+  done
+
+  # file <- hash <- project with server_side unsupported
+  local hash file pid side title
+  declare -A side_of=() title_of=()
+  while IFS=$'\t' read -r pid side title; do side_of["$pid"]="$side"; title_of["$pid"]="$title"; done < "$tmp/proj.tsv"
+  declare -A pid_of=()
+  while IFS=$'\t' read -r hash pid; do pid_of["$hash"]="$pid"; done < "$tmp/h2p.tsv"
+  while IFS=$'\t' read -r hash file; do
+    pid="${pid_of[$hash]:-}"
+    [[ -n "$pid" && "${side_of[$pid]:-}" == "unsupported" ]] && MR_CLIENT_ONLY["$file"]="${title_of[$pid]:-$pid}"
+  done < "$tmp/hashes.tsv"
+  log "Modrinth: matched $(wc -l < "$tmp/h2p.tsv") jar(s); ${#MR_CLIENT_ONLY[@]} marked client-only."
+  rm -rf "$tmp"
+}
 
 matches_pattern() {
   local name_lower="${1,,}"
@@ -286,8 +365,12 @@ echo ""
 
 metadata_removed=0
 pattern_removed=0
+modrinth_removed=0
 skipped_unknown=0
 server_safe=0
+kept_by_admin=0
+
+modrinth_lookup
 
 for jar in "$MODS_DIR"/*.jar; do
   [[ -f "$jar" ]] || continue
@@ -298,6 +381,11 @@ for jar in "$MODS_DIR"/*.jar; do
   # their own mods.toml claims about side compatibility — checking this
   # first prevents a wrong self-declared "both"/"server" from ever letting
   # them slip past.
+  if matches_keep "$name"; then
+    ((kept_by_admin++)) || true
+    continue
+  fi
+
   if matches_force_pattern "$name"; then
     reason="known crash-causing mod (forced, overrides metadata)"
     if "$DRY_RUN"; then
@@ -308,6 +396,20 @@ for jar in "$MODS_DIR"/*.jar; do
     fi
     ((moved++)) || true
     ((pattern_removed++)) || true
+    continue
+  fi
+
+  # Step 0c: Modrinth says this project does not run on servers.
+  if [[ -n "${MR_CLIENT_ONLY[$name]:-}" ]]; then
+    reason="Modrinth: ${MR_CLIENT_ONLY[$name]} is client-only"
+    if "$DRY_RUN"; then
+      echo "[cleaner]   [would disable] $name  ($reason)"
+    else
+      mv "$jar" "$DISABLED_DIR/$name"
+      echo "[cleaner]   [disabled] $name  ($reason)" | tee -a "$LOG_FILE"
+    fi
+    ((moved++)) || true
+    ((modrinth_removed++)) || true
     continue
   fi
 
@@ -367,7 +469,7 @@ done
 echo ""
 if "$DRY_RUN"; then
   log "Dry run complete."
-  log "  Would disable: $moved mod(s)  ($metadata_removed via metadata, $pattern_removed via filename)"
+  log "  Would disable: $moved mod(s)  ($modrinth_removed via Modrinth, $metadata_removed via metadata, $pattern_removed via filename)"
   log "  Server-safe (explicit metadata): $server_safe mod(s)"
   log "  Unknown environment (kept): $skipped_unknown mod(s)"
   log ""
@@ -375,9 +477,10 @@ if "$DRY_RUN"; then
   log "  Run with --restore --apply to move them back."
 else
   log "Done."
-  log "  Disabled: $moved mod(s)  ($metadata_removed via metadata, $pattern_removed via filename)"
+  log "  Disabled: $moved mod(s)  ($modrinth_removed via Modrinth, $metadata_removed via metadata, $pattern_removed via filename)"
   log "  Server-safe (explicit metadata): $server_safe mod(s)"
   log "  Unknown environment (kept): $skipped_unknown mod(s)"
+  [[ "$kept_by_admin" -gt 0 ]] && log "  Kept by BB_KEEP_MODS: $kept_by_admin mod(s)"
   log "  Log: $LOG_FILE"
   log "  To restore: bash clientmod_cleaner.sh --restore --apply"
 fi

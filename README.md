@@ -47,9 +47,9 @@ Boot-time runtime for the **BlazingBlue Unified** Minecraft egg. On every server
 
 v1 servers pull `main` on **every boot**, so don't touch `main` until everything is on v2.
 
-1. Push this code to a `v2` branch and tag it `v2.0.4`:
+1. Push this code to a `v2` branch and tag it `v2.0.5`:
    `git checkout -b v2 && git add -A && git commit -m "runtime v2" && git tag v2.0.1 && git push origin v2 v2.0.1`
-2. Import `egg-blazing-blue-unified-v2.json` over the existing "BlazingBlue Unified v2" egg. Its `RUNTIME_REF` defaults to `v2.0.4`.
+2. Import `egg-blazing-blue-unified-v2.json` over the existing "BlazingBlue Unified v2" egg. Its `RUNTIME_REF` defaults to `v2.0.5`.
 3. Make a test server on the v2 egg and walk through: fresh pack, restart, update, switch with a name, restore, new world.
 4. Point new Minecraft orders at the v2 egg id in the panel's provisioning code.
 5. Migrate existing servers:
