@@ -465,6 +465,53 @@ env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" FAKE_CURL_FAIL=modrint
   bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner2.log" 2>&1; LAST_LOG="$WORK/cleaner2.log"
 check "offline: Sodium still caught by pattern" test -f "$S/mods_disabled/sodium-neoforge-0.8.13+mc1.21.1.jar"
 
+t "27. Cleaner keeps a client-only mod that a kept mod requires, and self-heals"
+new_server cleaner-deps
+mkdir -p "$S/mods" "$WORK/jars/tip/META-INF" "$WORK/jars/more/META-INF" "$WORK/jars/zoom"
+cat > "$WORK/jars/tip/META-INF/neoforge.mods.toml" <<'T'
+modLoader="javafml"
+[[mods]]
+modId="simplytooltips"
+version="0.1.3"
+T
+cat > "$WORK/jars/more/META-INF/neoforge.mods.toml" <<'T'
+modLoader="javafml"
+[[mods]]
+modId="simplymore"
+[[dependencies.simplymore]]
+modId="simplytooltips"
+type="required"
+versionRange="[0.1.3,)"
+side="BOTH"
+[[dependencies.simplymore]]
+modId="jei"
+type="optional"
+side="BOTH"
+T
+echo '{"schemaVersion":1,"id":"zoomify","depends":{"minecraft":"*"}}' > "$WORK/jars/zoom/fabric.mod.json"
+(cd "$WORK/jars/tip"  && zip -qr "$S/mods/simplytooltips-0.1.3.jar" .)
+(cd "$WORK/jars/more" && zip -qr "$S/mods/simplymore-1.0.jar" .)
+(cd "$WORK/jars/zoom" && zip -qr "$S/mods/zoomify-2.14.jar" .)
+H_TIP="$(sha1sum "$S/mods/simplytooltips-0.1.3.jar" | cut -d' ' -f1)"
+H_ZOOM="$(sha1sum "$S/mods/zoomify-2.14.jar" | cut -d' ' -f1)"
+printf '{"%s":{"project_id":"TIP"},"%s":{"project_id":"ZOOM"}}' "$H_TIP" "$H_ZOOM" > "$SRV/mr-vf.json"
+echo '[{"id":"TIP","title":"Simply Tooltips","server_side":"unsupported"},{"id":"ZOOM","title":"Zoomify","server_side":"unsupported"}]' > "$SRV/mr-projects.json"
+# Simulate the old cleaner having already disabled simplytooltips
+mkdir -p "$S/mods_disabled"; mv "$S/mods/simplytooltips-0.1.3.jar" "$S/mods_disabled/"
+echo "[cleaner]   [disabled] simplytooltips-0.1.3.jar  (Modrinth: Simply Tooltips is client-only)" > "$S/.bb_client_mods.log"
+# A mod the customer disabled by hand must stay disabled
+printf 'manual' > "$S/mods_disabled/customer-choice.jar"
+env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" SERVER_DIR="$S" \
+  bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner3.log" 2>&1; LAST_LOG="$WORK/cleaner3.log"
+check "required dependency re-enabled"       test -f "$S/mods/simplytooltips-0.1.3.jar"
+check "reason logged"                        has "$WORK/cleaner3.log" "simplymore-1.0.jar requires it"
+check "unrelated client mod still disabled"  test -f "$S/mods_disabled/zoomify-2.14.jar"
+check "customer's own disabled mod untouched" test -f "$S/mods_disabled/customer-choice.jar"
+check "simplymore untouched"                 test -f "$S/mods/simplymore-1.0.jar"
+env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" SERVER_DIR="$S" \
+  bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner4.log" 2>&1; LAST_LOG="$WORK/cleaner4.log"
+check "stable on the next boot"              test -f "$S/mods/simplytooltips-0.1.3.jar" -a -f "$S/mods_disabled/zoomify-2.14.jar"
+
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
 check "1.18.2 -> 17"  bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.18.2) == 17 ]]"
