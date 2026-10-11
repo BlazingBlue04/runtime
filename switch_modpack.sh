@@ -415,6 +415,9 @@ if [[ -d "$BB_STASH_DIR" ]]; then
   warn "Found an unfinished install from a previous boot — restoring the previous install first."
   bb_stash_rollback
   bb_warn_status "The previous install was interrupted and has been rolled back."
+elif [[ -f "$BB_INFLIGHT_WORLD" ]]; then
+  warn "Found a world that was moved aside for an install that never started — putting it back."
+  bb_restore_inflight_world
 fi
 
 # ---------------------------------------
@@ -1865,6 +1868,18 @@ else
   rm -f .bb_wipe_consumed 2>/dev/null || true
 fi
 
+# Point PROVIDER/PACK_ID_NORM/... back at what the lock says is installed.
+describe_running_install() {
+  PROVIDER="$CURRENT_PROVIDER"; export PROVIDER
+  if [[ "$current_key" =~ ^[^:]+::([^:]*)::(.*)$ ]]; then
+    case "$PROVIDER" in
+      vanilla|paper|fabric|quilt|forge|neoforge|bedrock) : ;;
+      *) PACK_ID_NORM="${BASH_REMATCH[1]}"; VERSION_ID_NORM="${BASH_REMATCH[2]}"
+         RESOLVED_VERSION_ID="${BASH_REMATCH[2]}"; export PACK_ID_NORM VERSION_ID_NORM ;;
+    esac
+  fi
+}
+
 is_standalone() {
   case "${1:-}" in vanilla|paper|fabric|quilt|forge|neoforge) return 0 ;; *) return 1 ;; esac
 }
@@ -1888,10 +1903,33 @@ if [[ "$need_reinstall" -eq 1 && "$IS_SWITCH" -eq 0 && -n "$CURRENT_PROVIDER" ]]
   unset _installed_mc
 fi
 
+# ---------------------------------------
+# Don't retry a target that already failed and was rolled back. Otherwise every
+# restart would re-download, fail and roll back again (and archive/restore the
+# world each time). It is retried when the pack/version changes, or when the
+# panel sends {"action":"reinstall"} ("Try again").
+# ---------------------------------------
+BB_SKIPPED_FAILED=0
+if [[ -f "$BB_FAILURE_FILE" ]]; then
+  _failed_key="$(jq -r '.target_key // empty' "$BB_FAILURE_FILE" 2>/dev/null || true)"
+  if [[ "$_failed_key" != "$desired_key" || "$BB_REQ_ACTION" == "reinstall" ]]; then
+    rm -f "$BB_FAILURE_FILE"     # customer changed the target, or asked to retry
+    [[ "$BB_REQ_ACTION" == "reinstall" && "$_failed_key" == "$desired_key" && "$current_key" != "$desired_key" ]] && \
+      log "Retrying the previously failed install of ${desired_key} (requested)."
+  elif [[ -n "$CURRENT_PROVIDER" && "$need_reinstall" -eq 1 ]]; then
+    log "Not retrying ${desired_key}: it failed before ($(jq -r '.error // "unknown error"' "$BB_FAILURE_FILE")). Change the pack/version or use Try again."
+    need_reinstall=0; IS_SWITCH=0; BB_SKIPPED_FAILED=1
+    describe_running_install
+  fi
+  unset _failed_key
+fi
+[[ "$BB_REQ_ACTION" == "reinstall" && "$MANUAL" -eq 0 && "$current_key" != "$desired_key" ]] && need_reinstall=1
+
 # What kind of run is this? (shown in the panel)
 if   [[ "$IS_SWITCH" -eq 1 ]];                    then BB_RUN_KIND="switch"
 elif [[ -n "$BB_REQ_ACTION" && "$BB_REQ_ACTION" != "switch" ]]; then BB_RUN_KIND="$BB_REQ_ACTION"
 elif [[ "$WIPE_ONESHOT" -eq 1 ]];                 then BB_RUN_KIND="new_world"
+elif [[ "$BB_SKIPPED_FAILED" -eq 1 ]];           then BB_RUN_KIND="boot"
 elif [[ "$need_reinstall" -eq 1 && -z "$CURRENT_PROVIDER" ]]; then BB_RUN_KIND="install"
 elif [[ "$need_reinstall" -eq 1 ]];               then BB_RUN_KIND="update"
 else BB_RUN_KIND="boot"
@@ -1919,6 +1957,8 @@ if [[ -n "$_archive_reason" ]]; then
   bb_status archiving "Saving your current world"
   bb_world_archive "$_archive_reason" move "${_extras[@]}"
   WORLD_ARCHIVE_ID="$BB_LAST_ARCHIVE_ID"
+  # An install follows: if it doesn't finish for ANY reason, this world comes back.
+  [[ "$need_reinstall" -eq 1 && -n "$WORLD_ARCHIVE_ID" ]] && echo "$WORLD_ARCHIVE_ID" > "$BB_INFLIGHT_WORLD"
   unset _extras _d
 elif [[ "$need_reinstall" -eq 1 && -n "$CURRENT_PROVIDER" ]] && \
      [[ -n "${BB_DOWNGRADE_FROM:-}" || ( "${BB_PREUPDATE_BACKUP:-1}" != "0" && "${BB_BACKUP_KEEP:-2}" != "0" ) ]]; then
@@ -1941,6 +1981,7 @@ if [[ "$need_reinstall" -eq 1 ]]; then
   fi
   bb_status installing "Preparing install"
   if ! bb_stash_install "$_scope"; then
+    bb_restore_inflight_world || true
     bb_status failed "Could not prepare the install" "" "" "stash failed"
     exit 1
   fi
@@ -1948,33 +1989,36 @@ if [[ "$need_reinstall" -eq 1 ]]; then
   # Run the installer in a subshell WITH errexit, so any failing command aborts it
   # (errexit is ignored inside if/&&/|| contexts, hence the explicit set +e/-e dance).
   set +e
-  ( set -e; run_installer )
-  _rc=$?
+  ( set -e; run_installer ) 2>&1 | tee "$BB_INSTALL_OUTPUT"
+  _rc="${PIPESTATUS[0]}"
   set -e
 
   if [[ "$_rc" -ne 0 ]]; then
     err "Install failed (exit ${_rc})."
-    bb_stash_rollback
-    if [[ -n "$WORLD_ARCHIVE_ID" ]]; then
-      bb_world_restore "$WORLD_ARCHIVE_ID" || warn "Could not move the archived world back automatically: ${WORLD_ARCHIVE_ID}"
-    fi
+    # The installer's own last ERROR/FATAL line is the most useful reason to show.
+    _reason="$(grep -E '(ERROR|FATAL)[:]' "$BB_INSTALL_OUTPUT" 2>/dev/null | grep -v 'Install failed (exit' | tail -n1 \
+               | sed -E 's/^.*(ERROR|FATAL): *//' | cut -c1-300)"
+    [[ -n "$_reason" ]] || _reason="The installer exited with code ${_rc}."
+    _target_provider="$PROVIDER" _target_pack="${PACK_ID_NORM:-}" _target_version="${VERSION_ID_NORM:-}"
+    bb_stash_rollback      # also restores the world moved aside for this install
     BB_ROLLED_BACK=1; export BB_ROLLED_BACK
     if [[ -z "$CURRENT_PROVIDER" ]]; then
-      bb_status failed "Install failed" "" "" "The installer exited with code ${_rc}. Check the console for details."
+      bb_status failed "Install failed" "" "" "$_reason"
       exit "$_rc"
     fi
+    # Remember the failure so restarts don't retry it, and so the panel can explain it.
+    jq -n \
+      --arg at "$(bb_now)" --arg key "$desired_key" --arg err "$_reason" --arg rc "$_rc" \
+      --arg tp "$_target_provider" --arg tpk "$_target_pack" --arg tv "$_target_version" \
+      --arg rk "$current_key" \
+      --argjson running "$(jq -c '{provider, pack_id, file_id, pack_name, pack_version, mc_version, loader}' .bb_pack_info.json 2>/dev/null || echo null)" \
+      '{failed_at: $at, target_key: $key, error: $err, exit_code: ($rc|tonumber),
+        target: {provider: $tp, pack_id: $tpk, version: $tv},
+        running_key: $rk, running: $running}' > "$BB_FAILURE_FILE" 2>/dev/null || true
     # There was a working server before this — boot it instead of leaving the customer offline.
-    bb_status failed "Install failed — your previous server was restored and is starting" "" "" \
-      "The installer exited with code ${_rc}. Check the console for details."
+    bb_status failed "Install failed — your previous server was restored and is starting" "" "" "$_reason"
     # Describe what is actually running again (the lock is unchanged).
-    PROVIDER="$CURRENT_PROVIDER"; export PROVIDER
-    if [[ "$current_key" =~ ^[^:]+::([^:]*)::(.*)$ ]]; then
-      case "$PROVIDER" in
-        vanilla|paper|fabric|quilt|forge|neoforge|bedrock) : ;;
-        *) PACK_ID_NORM="${BASH_REMATCH[1]}"; VERSION_ID_NORM="${BASH_REMATCH[2]}"
-           RESOLVED_VERSION_ID="${BASH_REMATCH[2]}"; export PACK_ID_NORM VERSION_ID_NORM ;;
-      esac
-    fi
+    describe_running_install
     need_reinstall=0
     BB_INSTALL_FAILED=1
     BB_REQ_ACTION=""; BB_REQ_LEVEL_NAME=""; WIPE_ONESHOT=0
@@ -2042,6 +2086,7 @@ if [[ "$need_reinstall" -eq 1 ]]; then
       bb_stash_commit update
     fi
     echo "$desired_key" > "$LOCK_FILE"
+    rm -f "$BB_FAILURE_FILE" "$BB_INSTALL_OUTPUT"
     log "Install complete. Lock updated."
   fi
   unset _scope _rc

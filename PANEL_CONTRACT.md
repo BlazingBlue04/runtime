@@ -119,6 +119,36 @@ Show `warnings` even on success (for example, mods blocked by their author).
 
 ---
 
+### `last_failure`: an install that failed and was rolled back
+
+When an install fails on a server that was already working, the runtime puts the
+old install back, boots it, and records the failure in `.bb_last_failure.json`.
+The same object appears in every status as `last_failure` until it's resolved:
+
+```jsonc
+"last_failure": {
+  "failed_at": "2026-10-11T20:58:54Z",
+  "target_key": "curseforge::1::latest",
+  "error": "Pack ID 1 not found on CurseForge. Check PACK_ID is correct before reinstalling.",
+  "exit_code": 1,
+  "target":  { "provider": "curseforge", "pack_id": "1", "version": "latest" },
+  "running_key": "curseforge::1118358::9130561",
+  "running": { "provider": "curseforge", "pack_id": "1118358", "file_id": "9130561",
+               "pack_name": "…", "pack_version": "…", "mc_version": "1.21.1", "loader": "neoforge" }
+}
+```
+
+- **No retry loop:** while the variables still point at `target_key`, restarts
+  don't attempt the install again. They boot the restored server.
+- **Show a banner** when `last_failure` isn't null. `tools/panel/InstallFailureBanner.tsx`
+  is a ready-made one, offering Change modpack, Try again and Keep current.
+- **Try again:** write `{"action":"reinstall"}` to `.bb_request.json` and restart.
+- **Keep current:** set `PACK_PROVIDER`/`PACK_ID`/`VERSION_ID` to `running.provider` /
+  `running.pack_id` / `running.file_id`, then restart. Nothing reinstalls (the lock
+  already matches) and the failure clears.
+- It also clears on its own when the customer picks any other pack or version,
+  or when an install succeeds.
+
 ## 3. `.bb_worlds.json`
 
 ```jsonc
@@ -217,7 +247,7 @@ export interface BBWorldArchive {
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RUNTIME_REF` | `v2.0.8` | git ref the runtime is pulled from |
+| `RUNTIME_REF` | `v2.0.10` | git ref the runtime is pulled from |
 | `BB_WORLD_ARCHIVE_KEEP` | 5 | archives kept per reason |
 | `BB_BACKUP_KEEP` | 2 | pre-update backups kept (0 = no backups) |
 | `BB_ALLOW_MISSING_MODS` | 0 | 1 = finish a CurseForge install even if some mods failed to download |

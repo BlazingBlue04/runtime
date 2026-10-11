@@ -171,7 +171,7 @@ jq -n --arg p "$PACK_ID" --arg v "$VERSION_ID" \
   '{provider:"curseforge",pack_id:$p,file_id:$v,pack_name:("Pack "+$p),pack_version:$v,mc_version:"1.20.1",loader:"forge"}' > .bb_pack_info.json
 [[ -n "${FAKE_SHIP_PROPS:-}" ]] && printf 'level-type=skyblock\nmotd=Pack default motd\nmax-players=10\n' > server.properties
 [[ -n "${FAKE_WARN:-}" ]] && bb_warn_status "fake warning from installer"
-if [[ "${FAKE_FAIL:-}" == "1" ]]; then echo partial > mods/partial.jar; exit 7; fi
+if [[ "${FAKE_FAIL:-}" == "1" ]]; then echo partial > mods/partial.jar; echo "[curseforge] ERROR: Pack ID ${PACK_ID} not found on CurseForge. Check PACK_ID is correct before reinstalling." >&2; exit 7; fi
 echo "[fakecf] done"
 EOF
 
@@ -321,7 +321,7 @@ t "13. First install that fails exits nonzero with a clear status"
 new_server cf-fail
 boot "${CF[@]}" PACK_ID=111 VERSION_ID=1001 FAKE_FAIL=1
 check "exit code nonzero"                    test "$RC" -ne 0
-check "status failed"                        jqt "$S/.bb_install_status.json" '.state=="failed" and (.error|test("code 7"))'
+check "status failed with the real reason"  jqt "$S/.bb_install_status.json" '.state=="failed" and (.error|test("Pack ID 111 not found"))'
 check "no lock written"                      test ! -f "$S/.modpack.lock"
 
 t "14. Archive retention"
@@ -582,6 +582,55 @@ check "warning for the panel"                has "$S/.bb_install_warnings" "retr
 env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" SERVER_DIR="$S" \
   bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner7.log" 2>&1; LAST_LOG="$WORK/cleaner7.log"
 check "stays disabled after a clean log"     test -f "$S/mods_disabled/retrodamageindicators-1.0.jar"
+
+t "31. After a rollback: no retry loop, reason recorded, retry on request, cleared on change"
+new_server cf-noretry
+boot "${CF[@]}" PACK_ID=111 VERSION_ID=1
+mkworld world "keep-me"
+boot "${CF[@]}" PACK_ID=1 VERSION_ID=1 FAKE_FAIL=1
+check "rolled back, old server starting"     jqt "$S/.bb_install_status.json" '.state=="starting" and .rolled_back==true'
+check "real reason recorded"                 jqt "$S/.bb_install_status.json" '.last_failure.error | test("Pack ID 1 not found on CurseForge")'
+check "failure recorded for the panel"       jqt "$S/.bb_install_status.json" '.last_failure.target.pack_id=="1" and .last_failure.running.pack_id=="111"'
+boot "${CF[@]}" PACK_ID=1 VERSION_ID=1 FAKE_FAIL=1
+check "restart does not retry"               bash -c "! grep -q '^\[curseforge\] ERROR' '$LAST_LOG'"
+check "plain boot of the old pack"           jqt "$S/.bb_install_status.json" '.kind=="boot" and .state=="starting"'
+check "failure still shown"                  jqt "$S/.bb_install_status.json" '.last_failure.error | test("not found")'
+check "world untouched, no switch archive"   bash -c "grep -q keep-me '$S/world/level.dat' && { [[ ! -f '$S/.bb_worlds.json' ]] || jq -e '([.archives[]?|select(.reason==\"switch\")]|length)==0' '$S/.bb_worlds.json' >/dev/null; }"
+echo '{"id":"retry-1","action":"reinstall"}' > "$S/.bb_request.json"
+boot "${CF[@]}" PACK_ID=1 VERSION_ID=1 FAKE_FAIL=1
+check "Try again does retry"                 has "$LAST_LOG" "Pack ID 1 not found on CurseForge"
+boot "${CF[@]}" PACK_ID=222 VERSION_ID=2
+check "changing the pack clears the failure" jqt "$S/.bb_install_status.json" '.last_failure==null and .kind=="switch"'
+
+t "32. Killed mid-install during a switch: next boot restores files AND the world"
+new_server cf-killed
+boot "${CF[@]}" PACK_ID=111 VERSION_ID=1
+mkworld world "original-world"
+# Simulate: archive + stash happened, installer was half way, then the container was killed.
+(
+  cd "$S" && export BB_DIR="$S" PROVIDER=curseforge
+  source ./bb_lib.sh
+  bb_world_archive switch move
+  echo "$BB_LAST_ARCHIVE_ID" > "$BB_INFLIGHT_WORLD"
+  bb_stash_install full
+  mkdir -p mods && echo half > mods/half-installed.jar
+) > /dev/null 2>&1
+check "world was moved out (precondition)"   test ! -d "$S/world"
+boot "${CF[@]}" PACK_ID=111 VERSION_ID=1
+check "original world back"                  has "$S/world/level.dat" "original-world"
+check "old mods back, junk gone"             bash -c "test -f '$S/mods/pack-111-1.jar' && test ! -f '$S/mods/half-installed.jar'"
+check "marker cleared"                       test ! -f "$S/.bb_inflight_world_archive"
+
+t "33. Killed after archiving but before the stash: world still comes back"
+mkworld world "second-world"
+(
+  cd "$S" && export BB_DIR="$S" PROVIDER=curseforge
+  source ./bb_lib.sh
+  bb_world_archive switch move
+  echo "$BB_LAST_ARCHIVE_ID" > "$BB_INFLIGHT_WORLD"
+) > /dev/null 2>&1
+boot "${CF[@]}" PACK_ID=111 VERSION_ID=1
+check "world back"                           has "$S/world/level.dat" "second-world"
 
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
