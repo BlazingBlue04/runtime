@@ -269,6 +269,29 @@ loader_install() {
   bb_install_loader "$loader" "$mc" "$ver"
 }
 
+# CurseForge sometimes returns download URLs with raw spaces (and other characters
+# curl refuses), e.g. ".../create_sky_village-0.0.38 NeoForge 1.21.1.jar". curl
+# rejects those before sending anything (exit 3, logged as http 000), so encode
+# them. Existing %XX escapes are left alone.
+cf_url_safe() {
+  local u="$1"
+  u="${u// /%20}"; u="${u//\[/%5B}"; u="${u//\]/%5D}"; u="${u//\{/%7B}"; u="${u//\}/%7D}"
+  u="${u//|/%7C}"; u="${u//\"/%22}"; u="${u//</%3C}"; u="${u//>/%3E}"; u="${u//^/%5E}"; u="${u//\`/%60}"
+  printf '%s' "$u"
+}
+
+# One request for every project's CurseForge class, so resource packs and shaders
+# (client-only) can be skipped and data packs put where the server reads them.
+# Output: "<projectID> <classId>" lines. Empty output = unknown (treat as mods).
+cf_class_ids() {
+  local ids_json
+  ids_json="$(cut -f1 .bb_manifest_mods.txt | grep -E '^[0-9]+$' | jq -R -s -c 'split("\n") | map(select(length>0) | tonumber) | unique')" || return 0
+  curl -sS --retry 3 --max-time 60 -X POST \
+    -H "x-api-key: ${CF_API_KEY}" -H "Accept: application/json" -H "Content-Type: application/json" \
+    -d "{\"modIds\":${ids_json}}" "https://api.curseforge.com/v1/mods" 2>/dev/null \
+    | jq -r '.data[]? | "\(.id) \(.classId // 6)"' 2>/dev/null || true
+}
+
 download_mods_from_manifest_if_needed() {
   # If the pack zip is a client pack, overrides/ may not include any mods.
   # In that case, manifest.json contains the mod list (projectID + fileID).
@@ -301,13 +324,29 @@ download_mods_from_manifest_if_needed() {
   total="$(wc -l < .bb_manifest_mods.txt 2>/dev/null || echo 0)"
   echo "[curseforge] manifest: ${total} required mods to fetch."
 
-  local i=0
+  # classId: 6 mods, 12 resource packs, 6552 shaders, 6945 data packs
+  declare -A cls_of=()
+  local _cp _cc
+  while read -r _cp _cc; do [[ -n "$_cp" ]] && cls_of["$_cp"]="$_cc"; done < <(cf_class_ids)
+  echo "[curseforge] manifest: classified ${#cls_of[@]} project(s)."
+
+  local i=0 client_only=0
   local skipped_mods=()
   local retry_mods=()
   while read -r pid fid; do
     [[ -n "${pid:-}" && -n "${fid:-}" ]] || continue
     i=$((i+1))
     bb_status downloading_mods "Downloading mods" "$i" "$total"
+
+    local dest="./mods"
+    case "${cls_of[$pid]:-6}" in
+      12|6552)
+        # Resource packs and shaders only matter on players' clients.
+        client_only=$((client_only+1))
+        continue ;;
+      6945) dest="./.bb_pending_datapacks" ;;   # moved into <world>/datapacks by switch_modpack.sh
+    esac
+    mkdir -p "$dest"
 
     # Get download URL from CurseForge API
     local api="https://api.curseforge.com/v1/mods/${pid}/files/${fid}/download-url"
@@ -340,6 +379,7 @@ download_mods_from_manifest_if_needed() {
     fi
 
     local fname
+    url="$(cf_url_safe "$url")"
     fname="$(basename "${url%%\?*}")"
     # CurseForge download URLs are percent-encoded (spaces -> %20, brackets ->
     # %5b/%5d, apostrophes -> %27, etc). basename pulls the raw encoded string
@@ -351,29 +391,31 @@ download_mods_from_manifest_if_needed() {
     # by the "real" name silently fail to find the file.
     fname="$(printf '%b' "${fname//%/\\x}")"
     # Avoid re-download if already present
-    if [[ -f "./mods/${fname}" ]]; then
+    if [[ -f "${dest}/${fname}" ]]; then
       ok=$((ok+1))
       continue
     fi
 
-    local http_code
-    http_code="$(curl -sL --retry 3 --retry-delay 1 -A "Mozilla/5.0" \
-      -w "%{http_code}" -o "./mods/${fname}" "$url" 2>/dev/null)" || http_code="${http_code:-000}"
+    local http_code cerr=0
+    http_code="$(curl -gsL --retry 3 --retry-delay 1 -A "Mozilla/5.0" \
+      -w "%{http_code}" -o "${dest}/${fname}" "$url" 2>/dev/null)" || cerr=$?
+    [[ -n "$http_code" ]] || http_code="000"
+    [[ "$http_code" == "000" && "$cerr" -ne 0 ]] && http_code="000, curl exit ${cerr}"
 
-    if [[ "$http_code" =~ ^2[0-9][0-9]$ && -f "./mods/${fname}" && -s "./mods/${fname}" ]]; then
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ && -f "${dest}/${fname}" && -s "${dest}/${fname}" ]]; then
       ok=$((ok+1))
     elif [[ "$http_code" == "403" ]]; then
       # Mod author has disabled CDN distribution; permanent, no point retrying.
       echo "[curseforge] manifest: (${i}/${total}) ${fname} -> SKIPPED (403 forbidden; mod blocks redistribution)"
       skipped_mods+=("${fname}  ->  https://www.curseforge.com/minecraft/mc-mods/${pid}/files/${fid}")
-      rm -f "./mods/${fname}" 2>/dev/null || true
+      rm -f "${dest}/${fname}" 2>/dev/null || true
       fail=$((fail+1))
     else
       # Likely transient (rate limiting / network blip mid-batch) — queue for a
       # single retry pass after the main loop finishes, once the burst has settled.
       echo "[curseforge] manifest: (${i}/${total}) ${fname} -> FAILED (http ${http_code}), will retry"
-      rm -f "./mods/${fname}" 2>/dev/null || true
-      retry_mods+=("${fname}|${url}|${pid}|${fid}")
+      rm -f "${dest}/${fname}" 2>/dev/null || true
+      retry_mods+=("${fname}|${url}|${pid}|${fid}|${dest}")
       fail=$((fail+1))
     fi
 
@@ -399,24 +441,25 @@ download_mods_from_manifest_if_needed() {
     local r=0
     for entry in "${retry_mods[@]}"; do
       r=$((r+1))
-      local rfname rurl rpid rfid
-      IFS='|' read -r rfname rurl rpid rfid <<< "$entry"
+      local rfname rurl rpid rfid rdest
+      IFS='|' read -r rfname rurl rpid rfid rdest <<< "$entry"
+      rdest="${rdest:-./mods}"
       local rcode
-      rcode="$(curl -sL --retry 3 --retry-delay 2 -A "Mozilla/5.0" \
-        -w "%{http_code}" -o "./mods/${rfname}" "$rurl" 2>/dev/null)" || rcode="${rcode:-000}"
-      if [[ "$rcode" =~ ^2[0-9][0-9]$ && -f "./mods/${rfname}" && -s "./mods/${rfname}" ]]; then
+      rcode="$(curl -gsL --retry 3 --retry-delay 2 -A "Mozilla/5.0" \
+        -w "%{http_code}" -o "${rdest}/${rfname}" "$rurl" 2>/dev/null)" || rcode="${rcode:-000}"
+      if [[ "$rcode" =~ ^2[0-9][0-9]$ && -f "${rdest}/${rfname}" && -s "${rdest}/${rfname}" ]]; then
         echo "[curseforge] retry (${r}/${#retry_mods[@]}) ${rfname} -> OK"
         ok=$((ok+1))
         fail=$((fail-1))
       else
         echo "[curseforge] retry (${r}/${#retry_mods[@]}) ${rfname} -> STILL FAILED (http ${rcode})"
-        rm -f "./mods/${rfname}" 2>/dev/null || true
+        rm -f "${rdest}/${rfname}" 2>/dev/null || true
         failed_mods+=("${rfname}  ->  https://www.curseforge.com/minecraft/mc-mods/${rpid}/files/${rfid}")
       fi
     done
   fi
 
-  echo "[curseforge] manifest: complete (ok=${ok} fail=${fail})"
+  echo "[curseforge] manifest: complete (ok=${ok} fail=${fail}, client-only packs skipped=${client_only})"
 
   # Print a clear summary of EVERY mod that didn't make it in, so admins have
   # full visibility instead of only seeing the permanent (403) failures.

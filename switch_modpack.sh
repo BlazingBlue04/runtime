@@ -1863,6 +1863,23 @@ is_standalone() {
 CURRENT_PROVIDER="${current_key%%::*}"
 [[ "$current_key" == "<none>" ]] && CURRENT_PROVIDER=""
 
+# ---------------------------------------
+# Downgrade notice (standalone types). Minecraft can't properly load a world saved
+# by a newer version (chunks fail and come up as void). Downgrades are allowed,
+# but the customer is warned, and the pre_update backup below keeps the original.
+# ---------------------------------------
+if [[ "$need_reinstall" -eq 1 && "$IS_SWITCH" -eq 0 && -n "$CURRENT_PROVIDER" ]] \
+   && is_standalone "$PROVIDER" && [[ "${MC_VERSION:-latest}" != "latest" ]] \
+   && [[ "$BB_REQ_ACTION" != "new_world" && "$WIPE_ONESHOT" -eq 0 ]]; then
+  _installed_mc="$(detect_mc_version)"
+  if [[ "$_installed_mc" != "<unknown>" && "$_installed_mc" != "$MC_VERSION" && -n "$(bb_world_dirs)" ]] \
+     && [[ "$(printf '%s\n%s\n' "$MC_VERSION" "$_installed_mc" | sort -V | head -n1)" == "$MC_VERSION" ]]; then
+    BB_DOWNGRADE_FROM="$_installed_mc"
+    bb_warn_status "Downgraded from Minecraft ${_installed_mc} to ${MC_VERSION}. Worlds usually don't carry over to an older version (missing or void chunks). Your ${_installed_mc} world was backed up first and can be restored from Previous Worlds."
+  fi
+  unset _installed_mc
+fi
+
 # What kind of run is this? (shown in the panel)
 if   [[ "$IS_SWITCH" -eq 1 ]];                    then BB_RUN_KIND="switch"
 elif [[ -n "$BB_REQ_ACTION" && "$BB_REQ_ACTION" != "switch" ]]; then BB_RUN_KIND="$BB_REQ_ACTION"
@@ -1895,10 +1912,12 @@ if [[ -n "$_archive_reason" ]]; then
   bb_world_archive "$_archive_reason" move "${_extras[@]}"
   WORLD_ARCHIVE_ID="$BB_LAST_ARCHIVE_ID"
   unset _extras _d
-elif [[ "$need_reinstall" -eq 1 && -n "$CURRENT_PROVIDER" && "${BB_PREUPDATE_BACKUP:-1}" != "0" && "${BB_BACKUP_KEEP:-2}" != "0" ]]; then
+elif [[ "$need_reinstall" -eq 1 && -n "$CURRENT_PROVIDER" ]] && \
+     [[ -n "${BB_DOWNGRADE_FROM:-}" || ( "${BB_PREUPDATE_BACKUP:-1}" != "0" && "${BB_BACKUP_KEEP:-2}" != "0" ) ]]; then
   bb_status backing_up "Backing up your world before updating"
   if bb_world_archive pre_update copy; then
-    bb_world_prune pre_update "${BB_BACKUP_KEEP:-2}"
+    _keep="${BB_BACKUP_KEEP:-2}"; [[ "$_keep" =~ ^[0-9]+$ && "$_keep" -ge 1 ]] || _keep=1
+    bb_world_prune pre_update "$_keep"; unset _keep
   else
     bb_warn_status "Could not back up the world before updating (low disk?). Continuing with the update."
   fi
@@ -2038,6 +2057,26 @@ elif [[ -n "$_archive_reason" && -z "${BB_INSTALL_FAILED:-}" ]]; then
   else
     rm -f .bb_world_label
   fi
+fi
+# Data packs that came with the modpack: put them in the world's datapacks folder,
+# replacing the ones a previous version of the pack installed (tracked in
+# .bb_pack_datapacks.txt) so an update doesn't leave duplicates behind.
+if [[ -d .bb_pending_datapacks && "${PROVIDER:-}" != "bedrock" ]]; then
+  _dp_dir="$(bb_level_name)/datapacks"
+  mkdir -p "$_dp_dir"
+  if [[ -f .bb_pack_datapacks.txt ]]; then
+    while IFS= read -r _f; do [[ -n "$_f" ]] && rm -f -- "${_dp_dir}/${_f}"; done < .bb_pack_datapacks.txt
+  fi
+  : > .bb_pack_datapacks.txt
+  shopt -s nullglob
+  for _f in .bb_pending_datapacks/*; do
+    mv -f -- "$_f" "${_dp_dir}/"
+    basename "$_f" >> .bb_pack_datapacks.txt
+  done
+  shopt -u nullglob
+  rm -rf .bb_pending_datapacks
+  log "Installed $(wc -l < .bb_pack_datapacks.txt) pack data pack(s) into ${_dp_dir}"
+  unset _dp_dir _f
 fi
 [[ "$WIPE_ONESHOT" -eq 1 ]] && touch .bb_wipe_consumed
 if [[ -n "$_archive_reason" ]]; then
