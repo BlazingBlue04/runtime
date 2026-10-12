@@ -632,6 +632,19 @@ mkworld world "second-world"
 boot "${CF[@]}" PACK_ID=111 VERSION_ID=1
 check "world back"                           has "$S/world/level.dat" "second-world"
 
+t "34. Manually managed Paper server with a paper-*.jar (no server.jar, no lock)"
+new_server manual-paper
+head -c 200000 /dev/zero > "$S/paper-26.2-12.jar"
+mkdir -p "$S/plugins/Dungeons"; echo cfg > "$S/plugins/Dungeons/config.yml"
+mkworld world "dungeon-world"
+cp "$S/bb_lib.sh" "$S/bb_lib.sh.orig"; cp "$S/curseforge_install.sh" "$S/cf.orig"
+boot PACK_PROVIDER=paper MC_VERSION=latest MANUALLY_MANAGED=true
+check "boot succeeded"                       test "$RC" -eq 0
+check "started the paper jar"                started_with "paper-26.2-12.jar"
+check "did not run a runtime script"         bash -c "! grep -q 'Starting via script: ./bb_lib.sh' '$LAST_LOG'"
+check "runtime scripts not patched"          bash -c "cmp -s '$S/bb_lib.sh' '$S/bb_lib.sh.orig' && cmp -s '$S/curseforge_install.sh' '$S/cf.orig'"
+check "plugins and world untouched"          bash -c "test -f '$S/plugins/Dungeons/config.yml' && grep -q dungeon-world '$S/world/level.dat'"
+
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
 check "1.18.2 -> 17"  bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.18.2) == 17 ]]"

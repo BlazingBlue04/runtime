@@ -73,13 +73,13 @@ force_java_override() {
         export JAVA="/opt/java/${maj}/bin/java"
         export JAVA_HOME="/opt/java/${maj}"
         export PATH="/opt/java/${maj}/bin:$PATH"
-        log "[switch] Java override applied: JAVA_MAJOR=$maj -> $JAVA"
+        log "Java override applied: JAVA_MAJOR=$maj -> $JAVA"
       else
-        log "[switch] WARN: JAVA_MAJOR=$maj requested but /opt/java/${maj}/bin/java not found"
+        log "WARN: JAVA_MAJOR=$maj requested but /opt/java/${maj}/bin/java not found"
       fi
       ;;
     *)
-      log "[switch] WARN: JAVA_MAJOR='$maj' is not one of 8/11/17/21/25; ignoring"
+      log "WARN: JAVA_MAJOR='$maj' is not one of 8/11/17/21/25; ignoring"
       ;;
   esac
 }
@@ -729,6 +729,9 @@ if glob_jar_ok "./minecraft_server.*.jar"; then has_any_start_artifact=1; fi
 if glob_jar_ok "./forge-*.jar"; then has_any_start_artifact=1; fi
 if glob_jar_ok "./fabric-server-launch*.jar" 1000; then has_any_start_artifact=1; fi
 if glob_jar_ok "./quilt-server-launch*.jar" 1000; then has_any_start_artifact=1; fi
+for _pj in ./paper-*.jar ./purpur-*.jar ./folia-*.jar ./pufferfish-*.jar ./spigot-*.jar ./leaf-*.jar; do
+  jar_ok "$_pj" && { has_any_start_artifact=1; break; }
+done; unset _pj
 if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then has_any_start_artifact=1; fi
@@ -1053,7 +1056,7 @@ find_start_candidate() {
   # Any shell script in top-level or scripts/ (covers packs like RLCraft that ship oddly named scripts)
   local any_sh
   any_sh="$(find . -maxdepth 2 -type f -name '*.sh' 2>/dev/null \
-    | grep -Ev '^\./(switch_modpack\.sh|curseforge_install\.sh|modrinth_install\.sh|ftb_install\.sh|clientmod_cleaner\.sh|generate_jvm_args\.sh|\.bb_tmp_start\.sh)$' \
+    | grep -Ev '^\./(switch_modpack\.sh|bb_lib\.sh|curseforge_install\.sh|modrinth_install\.sh|ftb_install\.sh|clientmod_cleaner\.sh|generate_jvm_args\.sh|\.bb_tmp_start\.sh)$' \
     | head -n 1 || true)"
   if [[ -n "$any_sh" ]]; then
     echo "$any_sh"
@@ -1085,6 +1088,9 @@ disable_restart_loops_in_scripts() {
   shopt -s nullglob
   for f in ./*.sh ./*.command; do
     [[ -f "$f" ]] || continue
+    case "${f#./}" in
+      switch_modpack.sh|bb_lib.sh|curseforge_install.sh|modrinth_install.sh|ftb_install.sh|clientmod_cleaner.sh|generate_jvm_args.sh) continue ;;
+    esac
 
     # Detect restart-wrapper scripts broadly:
     #  - classic countdown phrases
@@ -1197,6 +1203,7 @@ PY
   done
   shopt -u nullglob
   [[ "$changed" == "1" ]] && log "Patched auto-restart wrapper(s) in root scripts."
+  return 0
 }
 
 fix_legacy_forge_jar_reference() {
@@ -1731,6 +1738,19 @@ start_server() {
   if jar_ok "./quilt-server-launch.jar" 1000; then
     log "Starting via quilt-server-launch.jar (Xmx=${MAX_RAM:-default})"
     _bb_exec "$JAVA" "${_memflags[@]}" -jar ./quilt-server-launch.jar nogui
+  fi
+
+  # Hand-placed Paper-family jar (manually managed servers): paper-26.2-12.jar etc.
+  if [[ ! -f "./server.jar" ]]; then
+    local _pj=""
+    for _pj in ./paper-*.jar ./purpur-*.jar ./folia-*.jar ./pufferfish-*.jar ./leaf-*.jar ./spigot-*.jar; do
+      jar_ok "$_pj" && break
+      _pj=""
+    done
+    if [[ -n "$_pj" ]]; then
+      log "Starting via ${_pj#./} (Xmx=${MAX_RAM:-default})"
+      _bb_exec "$JAVA" "${_memflags[@]}" -jar "$_pj" nogui
+    fi
   fi
 
   if [[ -f "./server.jar" ]]; then
