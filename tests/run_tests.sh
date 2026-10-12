@@ -645,6 +645,14 @@ check "did not run a runtime script"         bash -c "! grep -q 'Starting via sc
 check "runtime scripts not patched"          bash -c "cmp -s '$S/bb_lib.sh' '$S/bb_lib.sh.orig' && cmp -s '$S/curseforge_install.sh' '$S/cf.orig'"
 check "plugins and world untouched"          bash -c "test -f '$S/plugins/Dungeons/config.yml' && grep -q dungeon-world '$S/world/level.dat'"
 
+t "35. Learned client-only crashes survive a pack switch"
+new_server learned-switch
+boot "${CF[@]}" PACK_ID=111 VERSION_ID=1
+printf 'retrodamageindicators\ndistraction_free_recipes\n' > "$S/.bb_cleaner_learned.txt"
+boot "${CF[@]}" PACK_ID=222 VERSION_ID=2
+check "switch succeeded"                     jqt "$S/.bb_install_status.json" '.kind=="switch" and .state!="failed"'
+check "learned list kept"                    bash -c "grep -qx retrodamageindicators '$S/.bb_cleaner_learned.txt' && grep -qx distraction_free_recipes '$S/.bb_cleaner_learned.txt'"
+
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
 check "1.18.2 -> 17"  bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.18.2) == 17 ]]"

@@ -19,7 +19,7 @@
 [[ -n "${__BB_LIB_LOADED:-}" ]] && return 0
 __BB_LIB_LOADED=1
 
-BB_LIB_VERSION="2.0.11"
+BB_LIB_VERSION="2.0.12"
 BB_DIR="${BB_DIR:-${SERVER_DIR:-/home/container}}"
 BB_UA="${BB_UA:-BlazingBlue-runtime/${BB_LIB_VERSION} (support@blazingblue.org)}"
 
@@ -630,7 +630,7 @@ _bb_keep_list() {
     "$BB_STATUS_FILE" .bb_request.json .bb_request.last.json \
     .bb_runtime_version .bb_last_crash.log .bb_wipe_consumed .bb_world_label \
     "$BB_WARN_FILE" .bb_pack_datapacks.txt "$BB_FAILURE_FILE" "$BB_INSTALL_OUTPUT" "$BB_INFLIGHT_WORLD" \
-    .modpack.lock eula.txt \
+    .modpack.lock eula.txt .bb_cleaner_learned.txt \
     backups archives world-backups .bb_backups \
     "${BB_RUNTIME_FILES[@]}"
   if [[ "${PROVIDER:-}" == "bedrock" ]]; then
