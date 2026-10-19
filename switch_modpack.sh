@@ -132,6 +132,15 @@ jar_ok() {
   [[ "$size" -ge "$minsize" ]]
 }
 
+# Loader launcher jars (fabric-server-launch.jar etc.) can be tiny: current Fabric
+# installers write a ~600-byte jar that is only a manifest whose Class-Path points
+# into libraries/. Validate by manifest, not by size.
+launcher_jar_ok() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  unzip -p "$f" META-INF/MANIFEST.MF 2>/dev/null | grep -qi '^Main-Class:'
+}
+
 glob_jar_ok() {
   local pattern="$1" minsize="${2:-10000}"
   local f
@@ -716,8 +725,8 @@ if jar_ok "./start-server.jar"; then has_any_start_artifact=1; fi          # FTB
 if [[ -f "./unix_args.txt" || -L "./unix_args.txt" ]]; then has_any_start_artifact=1; fi  # FTB/modern Forge argfile symlink
 if glob_jar_ok "./minecraft_server.*.jar"; then has_any_start_artifact=1; fi
 if glob_jar_ok "./forge-*.jar"; then has_any_start_artifact=1; fi
-if glob_jar_ok "./fabric-server-launch*.jar" 1000; then has_any_start_artifact=1; fi
-if glob_jar_ok "./quilt-server-launch*.jar" 1000; then has_any_start_artifact=1; fi
+if launcher_jar_ok "./fabric-server-launch.jar"; then has_any_start_artifact=1; fi
+if launcher_jar_ok "./quilt-server-launch.jar"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/minecraftforge/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/forge/*/unix_args.txt"; then has_any_start_artifact=1; fi
 if has_glob "./libraries/net/neoforged/neoforge/*/unix_args.txt"; then has_any_start_artifact=1; fi
@@ -1584,19 +1593,6 @@ start_server() {
     err "bedrock_server binary not found after install."
     exit 1
   fi
-  # Fabric/Quilt: the launcher jar is always the right entry point. Pack scripts
-  # (and leftover run.sh files) either re-download the loader or run server.jar,
-  # which silently boots vanilla with no mods.
-  if [[ "$loader" == "fabric" || "$loader" == "quilt" ]]; then
-    local _ld="./${loader}-server-launch.jar" _mf0=()
-    if jar_ok "$_ld" 1000; then
-      [[ -n "${MIN_RAM:-}" ]] && _mf0+=("-Xms${MIN_RAM}")
-      [[ -n "${MAX_RAM:-}" ]] && _mf0+=("-Xmx${MAX_RAM}")
-      log "Starting via ${_ld} (loader=${loader}, Xmx=${MAX_RAM:-default})"
-      _bb_exec "$JAVA" "${_mf0[@]}" -jar "$_ld" nogui
-    fi
-  fi
-
   # Always accept EULA before any launch (packs sometimes recreate eula.txt)
   accept_eula
 
@@ -1626,6 +1622,23 @@ start_server() {
   ensure_java_wrapper "$JAVA"
 
   bb_status starting "Starting server"
+
+  # Fabric/Quilt: the launcher jar is always the right entry point. Pack scripts
+  # (and leftover run.sh files) either re-download the loader or run server.jar,
+  # which silently boots vanilla with no mods.
+  if [[ "$loader" == "fabric" || "$loader" == "quilt" ]]; then
+    local _ld="./${loader}-server-launch.jar" _mf0=()
+    if launcher_jar_ok "$_ld"; then
+      if [[ -n "${MIN_RAM:-}" ]]; then _mf0+=("-Xms${MIN_RAM}"); fi
+      if [[ -n "${MAX_RAM:-}" ]]; then _mf0+=("-Xmx${MAX_RAM}"); fi
+      log "Starting via ${_ld} (loader=${loader}, Xmx=${MAX_RAM:-default})"
+      _bb_exec "$JAVA" "${_mf0[@]}" -jar "$_ld" nogui
+    else
+      err "Loader is ${loader} but ${_ld} is missing or invalid. Refusing to start vanilla server.jar on a modded install (it would strip modded blocks from the world). Reinstall the pack."
+      exit 1
+    fi
+  fi
+
 
   # 1) Dedicated run scripts (best)
   for s in "./run.sh" "./startserver.sh" "./LaunchServer.sh" "./ServerStart.sh" "./StartServer.sh"; do
@@ -1725,11 +1738,11 @@ start_server() {
 
   # Fabric/Quilt installers leave BOTH a launcher jar and server.jar (= vanilla).
   # Launching server.jar would silently start a vanilla server with no mods.
-  if jar_ok "./fabric-server-launch.jar" 1000; then
+  if launcher_jar_ok "./fabric-server-launch.jar"; then
     log "Starting via fabric-server-launch.jar (Xmx=${MAX_RAM:-default})"
     _bb_exec "$JAVA" "${_memflags[@]}" -jar ./fabric-server-launch.jar nogui
   fi
-  if jar_ok "./quilt-server-launch.jar" 1000; then
+  if launcher_jar_ok "./quilt-server-launch.jar"; then
     log "Starting via quilt-server-launch.jar (Xmx=${MAX_RAM:-default})"
     _bb_exec "$JAVA" "${_memflags[@]}" -jar ./quilt-server-launch.jar nogui
   fi
