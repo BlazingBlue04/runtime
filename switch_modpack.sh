@@ -1584,19 +1584,6 @@ start_server() {
     err "bedrock_server binary not found after install."
     exit 1
   fi
-  # Fabric/Quilt: the launcher jar is always the right entry point. Pack scripts
-  # (and leftover run.sh files) either re-download the loader or run server.jar,
-  # which silently boots vanilla with no mods.
-  if [[ "$loader" == "fabric" || "$loader" == "quilt" ]]; then
-    local _ld="./${loader}-server-launch.jar" _mf0=()
-    if jar_ok "$_ld" 1000; then
-      [[ -n "${MIN_RAM:-}" ]] && _mf0+=("-Xms${MIN_RAM}")
-      [[ -n "${MAX_RAM:-}" ]] && _mf0+=("-Xmx${MAX_RAM}")
-      log "Starting via ${_ld} (loader=${loader}, Xmx=${MAX_RAM:-default})"
-      _bb_exec "$JAVA" "${_mf0[@]}" -jar "$_ld" nogui
-    fi
-  fi
-
   # Always accept EULA before any launch (packs sometimes recreate eula.txt)
   accept_eula
 
@@ -1626,6 +1613,22 @@ start_server() {
   ensure_java_wrapper "$JAVA"
 
   bb_status starting "Starting server"
+
+  # Fabric/Quilt: the launcher jar is always the right entry point. Pack scripts
+  # (and leftover run.sh files) either re-download the loader or run server.jar,
+  # which silently boots vanilla with no mods.
+  if [[ "$loader" == "fabric" || "$loader" == "quilt" ]]; then
+    local _ld="./${loader}-server-launch.jar" _mf0=()
+    if jar_ok "$_ld" 1000; then
+      if [[ -n "${MIN_RAM:-}" ]]; then _mf0+=("-Xms${MIN_RAM}"); fi
+      if [[ -n "${MAX_RAM:-}" ]]; then _mf0+=("-Xmx${MAX_RAM}"); fi
+      log "Starting via ${_ld} (loader=${loader}, Xmx=${MAX_RAM:-default})"
+      _bb_exec "$JAVA" "${_mf0[@]}" -jar "$_ld" nogui
+    else
+      warn "Loader is ${loader} but ${_ld} is missing or truncated; falling back to normal start detection."
+    fi
+  fi
+
 
   # 1) Dedicated run scripts (best)
   for s in "./run.sh" "./startserver.sh" "./LaunchServer.sh" "./ServerStart.sh" "./StartServer.sh"; do
