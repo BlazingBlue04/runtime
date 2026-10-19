@@ -175,15 +175,54 @@ mkdir -p .bb_tmp_unpack
 unzip -q serverpack.zip -d .bb_tmp_unpack || die "Failed to unzip serverpack.zip"
 rm -f serverpack.zip
 
-# Some CurseForge "server packs" are wrapped in a single top-level folder.
-# Others place the real server files in overrides/. Normalize both.
+# Some CurseForge "server packs" are wrapped in a single top-level folder,
+# some are a zip inside the zip (e.g. Prominence II), and some place the real
+# server files in overrides/. Normalize all of them.
 SRC_ROOT=".bb_tmp_unpack"
 
-# Flatten one-level wrapper directory (ignore __MACOSX)
-mapfile -t _entries < <(find "${SRC_ROOT}" -mindepth 1 -maxdepth 1 -print)
-if [[ ${#_entries[@]} -eq 1 && -d "${_entries[0]}" && "$(basename "${_entries[0]}")" != "__MACOSX" ]]; then
-  SRC_ROOT="${_entries[0]}"
-fi
+# Unwrap nested server packs: zip-in-zip and/or wrapper folders (up to 4 levels).
+unwrap_pack() {
+  local dir="$1" depth=0 e
+  local -a entries zips kids dirs
+  # Anything that marks a directory as the real server root (don't unwrap past it).
+  _is_server_root() {
+    local d="$1"
+    [[ -d "$d/mods" || -d "$d/config" || -d "$d/overrides" || -d "$d/libraries" ]] && return 0
+    [[ -f "$d/variables.txt" || -f "$d/manifest.json" || -f "$d/server.properties" ]] && return 0
+    compgen -G "$d/*.jar" >/dev/null && return 0
+    compgen -G "$d/*.sh" >/dev/null && return 0
+    return 1
+  }
+  while (( depth < 4 )); do
+    rm -rf "$dir/__MACOSX"
+    shopt -s nullglob dotglob
+    entries=("$dir"/*)
+    zips=("$dir"/*.zip)
+    shopt -u nullglob dotglob
+    dirs=()
+    for e in "${entries[@]}"; do [[ -d "$e" ]] && dirs+=("$e"); done
+
+    if (( ${#zips[@]} == 1 )) && ! _is_server_root "$dir"; then
+      echo "[curseforge] Nested archive detected: $(basename "${zips[0]}") - extracting..."
+      unzip -qo "${zips[0]}" -d "$dir" || die "Failed to unzip nested $(basename "${zips[0]}")"
+      rm -f "${zips[0]}"
+    elif (( ${#dirs[@]} == 1 )) && ! _is_server_root "$dir"; then
+      # One folder, optionally next to READMEs/notes: that folder is the real pack.
+      echo "[curseforge] Flattening wrapper folder: $(basename "${dirs[0]}")"
+      local inner="${dirs[0]}" tmp="$dir/.bb_unwrap_$$"
+      mv "$inner" "$tmp"
+      shopt -s nullglob dotglob
+      kids=("$tmp"/*)
+      shopt -u nullglob dotglob
+      if (( ${#kids[@]} )); then mv "${kids[@]}" "$dir"/; fi
+      rmdir "$tmp"
+    else
+      break
+    fi
+    depth=$((depth + 1))
+  done
+}
+unwrap_pack "${SRC_ROOT}"
 
 # Copy top-level items into server dir
 shopt -s dotglob nullglob
@@ -204,6 +243,9 @@ if [[ -d "./overrides" ]]; then
   shopt -u dotglob nullglob
   rm -rf ./overrides
 fi
+
+# Done with the staging area; don't leave it eating the customer's disk quota.
+rm -rf .bb_tmp_unpack
 
 # Ensure bundled scripts are executable (start.sh/run.sh/etc.)
 chmod +x ./*.sh 2>/dev/null || true
@@ -519,9 +561,33 @@ download_mods_from_manifest_if_needed() {
   fi
 }
 
+# ServerPackCreator-style packs (Prominence II etc.) ship variables.txt with the
+# exact loader/MC versions but no loader jar — their start scripts download the
+# loader at runtime. Install the loader ourselves instead.
+_vt_get() {
+  grep -E "^$1=" ./variables.txt | head -n1 | cut -d= -f2- | tr -d '"\r ' || true
+}
+bootstrap_from_variables_txt() {
+  [[ -f ./variables.txt ]] || return 1
+  local mc loader ver
+  mc="$(_vt_get MINECRAFT_VERSION)"
+  loader="$(_vt_get MODLOADER)"; loader="${loader,,}"
+  ver="$(_vt_get MODLOADER_VERSION)"
+  [[ -n "$mc" && -n "$loader" && -n "$ver" ]] || return 1
+  case "$loader" in forge|neoforge|fabric|quilt) ;; *) return 1 ;; esac
+  echo "[curseforge] variables.txt: mc=${mc} loader=${loader} ver=${ver}"
+  loader_install "$loader" "$mc" "$ver" || die "Installing ${loader} ${ver} for Minecraft ${mc} failed."
+}
+
 # -----------------------------
 # Main execution: bootstrap if needed, then download mods if needed
 # -----------------------------
+
+# Prefer variables.txt over the pack's own start.sh (must run before have_runnable,
+# since these packs usually ship a start.sh that would otherwise skip the install).
+if [[ -f ./variables.txt && ! -d ./libraries && ! -f ./fabric-server-launch.jar && ! -f ./quilt-server-launch.jar ]]; then
+  bootstrap_from_variables_txt || echo "[curseforge] WARN: variables.txt present but unusable; falling back."
+fi
 
 # Run manifest-based bootstrap only if we don't already have runnable artifacts
 if ! have_runnable; then
