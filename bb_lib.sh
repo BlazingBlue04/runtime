@@ -19,7 +19,7 @@
 [[ -n "${__BB_LIB_LOADED:-}" ]] && return 0
 __BB_LIB_LOADED=1
 
-BB_LIB_VERSION="2.0.12"
+BB_LIB_VERSION="2.0.4"
 BB_DIR="${BB_DIR:-${SERVER_DIR:-/home/container}}"
 BB_UA="${BB_UA:-BlazingBlue-runtime/${BB_LIB_VERSION} (support@blazingblue.org)}"
 
@@ -27,12 +27,6 @@ BB_STATUS_FILE="${BB_STATUS_FILE:-.bb_install_status.json}"
 BB_WORLDS_DIR=".bb_worlds"
 BB_WORLDS_INDEX=".bb_worlds.json"
 BB_STASH_DIR=".bb_prev_install"
-BB_FAILURE_FILE=".bb_last_failure.json"   # set after a rolled-back install; see PANEL_CONTRACT.md
-BB_INSTALL_OUTPUT=".bb_install_output.log"
-# Archive id of a world moved aside for an install that hasn't finished yet.
-# Every rollback path (failed installer, script killed, next-boot recovery)
-# reads it and puts that world back. Removed once the install commits.
-BB_INFLIGHT_WORLD=".bb_inflight_world_archive"
 
 _bbl()  { echo "[bb] $*" >&2; }
 _bbw()  { echo "[bb] WARN: $*" >&2; }
@@ -78,7 +72,6 @@ bb_status() {
     --arg pack_id    "${PACK_ID_NORM:-${PACK_ID:-}}" \
     --arg version    "${VERSION_ID_NORM:-${VERSION_ID:-}}" \
     --arg runtime    "$BB_LIB_VERSION" \
-    --argjson last_failure "$(jq -c . "${BB_DIR}/${BB_FAILURE_FILE}" 2>/dev/null || echo null)" \
     '{
        request_id: (if $request_id == "" then null else $request_id end),
        kind: $kind,
@@ -93,7 +86,6 @@ bb_status() {
        warnings: ($warnings | split("\n") | map(select(length > 0))),
        pack: {provider: $provider, pack_id: $pack_id, version: $version},
        runtime_version: $runtime,
-       last_failure: $last_failure,
        started_at: $started,
        updated_at: $updated
      }' > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
@@ -491,14 +483,14 @@ bb_world_archive() {
 
   jq -n \
     --arg id "$id" --arg reason "$reason" --arg created "$(bb_now)" \
-    --arg level "$(bb_level_name)" --arg label "$(bb_world_label)" \
+    --arg level "$(bb_level_name)" --arg disp "$(bb_world_label)" \
     --arg lock "$lock" --argjson pinfo "$pinfo" \
     --arg size "${size:-0}" \
     --arg dirs "$(printf '%s\n' "${dirs[@]}")" \
     --arg extras "$(printf '%s\n' "${extras[@]}")" \
     '{
        id: $id, reason: $reason, created_at: $created,
-       level_name: $level, display_name: $label,
+       level_name: $level, display_name: $disp,
        pack: {
          key: $lock,
          provider: ($pinfo.provider // null),
@@ -512,7 +504,13 @@ bb_world_archive() {
        size_bytes: ($size|tonumber),
        world_dirs: ($dirs | split("\n") | map(select(length>0))),
        extra_dirs: ([$extras | split("\n")[] | select(length>0)])
-     }' > "${dest}/meta.json"
+     }' > "${dest}/meta.json" 2>/dev/null || {
+    # The world folders are ALREADY moved. Never leave them without a meta.json:
+    # reindex skips archives without one, which hides the world from the panel.
+    _bbw "archive: full metadata write failed; writing minimal meta.json for ${id}"
+    printf '{"id":"%s","reason":"%s","created_at":"%s","level_name":"%s","display_name":"%s","pack":{"key":"%s"},"size_bytes":%s,"world_dirs":[],"extra_dirs":[]}\n' \
+      "$id" "$reason" "$(bb_now)" "$(bb_level_name)" "$(bb_level_name)" "$lock" "${size:-0}" > "${dest}/meta.json"
+  }
 
   BB_LAST_ARCHIVE_ID="$id"
   _bbl "World archived (${reason}, ${mode}): ${id} [${moved[*]}]"
@@ -629,8 +627,8 @@ _bb_keep_list() {
     "$BB_STASH_DIR" "$BB_WORLDS_DIR" "$BB_WORLDS_INDEX" \
     "$BB_STATUS_FILE" .bb_request.json .bb_request.last.json \
     .bb_runtime_version .bb_last_crash.log .bb_wipe_consumed .bb_world_label \
-    "$BB_WARN_FILE" .bb_pack_datapacks.txt "$BB_FAILURE_FILE" "$BB_INSTALL_OUTPUT" "$BB_INFLIGHT_WORLD" \
-    .modpack.lock eula.txt .bb_cleaner_learned.txt \
+    "$BB_WARN_FILE" .bb_pack_datapacks.txt \
+    .modpack.lock eula.txt \
     backups archives world-backups .bb_backups \
     "${BB_RUNTIME_FILES[@]}"
   if [[ "${PROVIDER:-}" == "bedrock" ]]; then
@@ -737,18 +735,7 @@ bb_stash_commit() {
     fi
   fi
   rm -rf -- "${BB_STASH_DIR:?}"
-  rm -f -- "$BB_INFLIGHT_WORLD"
   _bbl "Install committed; previous install discarded."
-}
-
-# Put back a world that was moved aside for an install that never finished.
-bb_restore_inflight_world() {
-  [[ -f "$BB_INFLIGHT_WORLD" ]] || return 0
-  local id; id="$(tr -d '[:space:]' < "$BB_INFLIGHT_WORLD")"
-  if [[ -n "$id" && -d "${BB_WORLDS_DIR}/${id}" ]]; then
-    bb_world_restore "$id" || { _bbw "could not restore world ${id}; it is still in ${BB_WORLDS_DIR}/"; return 1; }
-  fi
-  rm -f -- "$BB_INFLIGHT_WORLD"
 }
 
 # Undo a failed install. Safe to call if no stash exists.
@@ -785,5 +772,4 @@ bb_stash_rollback() {
   shopt -u dotglob nullglob
   rm -rf -- "${BB_STASH_DIR:?}"
   _bbl "Rolled back to the previous install (${scope})."
-  bb_restore_inflight_world
 }
