@@ -3,9 +3,13 @@ set -euo pipefail
 
 # BlazingBlue Unified Egg - CurseForge installer (server pack aware)
 # Env:
-#   CF_API_KEY (required)
-#   PACK_ID (project id) (required)
+#   CF_API_KEY (required, except in local zip mode)
+#   PACK_ID (project id) (required, except in local zip mode)
 #   VERSION_ID (file id or "latest") (optional)
+#   BB_LOCAL_ZIP (optional) path to an uploaded server pack zip. Skips the
+#     CurseForge lookup and download; everything after (unwrap, overrides,
+#     loader bootstrap, manifest mods) runs the same. Used by PACK_PROVIDER=zip.
+#   BB_LOCAL_ZIP_NAME (optional) display name for the uploaded pack
 #   DEBUG (0/1)
 
 debug() { [[ "${DEBUG:-0}" == "1" ]] && echo "[curseforge][debug] $*" || true; }
@@ -29,9 +33,16 @@ API_KEY="${CF_API_KEY:-}"
 PACK_ID="${PACK_ID:-}"
 VERSION_ID="${VERSION_ID:-latest}"
 
-need "$API_KEY" "CF_API_KEY"
-CF_API_KEY="${CF_API_KEY:-$API_KEY}"
-need "$PACK_ID" "PACK_ID"
+LOCAL_ZIP="${BB_LOCAL_ZIP:-}"
+PACK_PROVIDER_LABEL="curseforge"
+if [[ -n "$LOCAL_ZIP" ]]; then
+  [[ -f "$LOCAL_ZIP" ]] || die "Uploaded server pack not found: ${LOCAL_ZIP}"
+  PACK_PROVIDER_LABEL="zip"
+else
+  need "$API_KEY" "CF_API_KEY"
+  CF_API_KEY="${CF_API_KEY:-$API_KEY}"
+  need "$PACK_ID" "PACK_ID"
+fi
 
 req_json() {
   # Usage: req_json /v1/mods/123
@@ -103,6 +114,10 @@ cf_resolve_latest_file_id() {
   rm -rf "$tmp"
 }
 
+if [[ -n "$LOCAL_ZIP" ]]; then
+  MOD_NAME="${BB_LOCAL_ZIP_NAME:-Uploaded server pack}"
+  echo "[curseforge] Local mode: installing uploaded server pack '${MOD_NAME}' from ${LOCAL_ZIP}"
+else
 bb_status installing "Looking up modpack on CurseForge"
 echo "[curseforge] Retrieving project info for ${PACK_ID}..."
 MOD_JSON="$(req_json "/v1/mods/${PACK_ID}")"
@@ -167,13 +182,19 @@ echo "[curseforge] Downloading server pack..."
 bb_status installing "Downloading ${MOD_NAME:-modpack}"
 rm -f serverpack.zip
 wget -qO serverpack.zip "$DL_URL" || die "Download failed for: $DL_URL"
+fi  # end CurseForge lookup + download (skipped in local zip mode)
 
 echo "[curseforge] Unpacking serverpack.zip..."
 bb_status installing "Unpacking ${MOD_NAME:-modpack}"
 rm -rf .bb_tmp_unpack
 mkdir -p .bb_tmp_unpack
-unzip -q serverpack.zip -d .bb_tmp_unpack || die "Failed to unzip serverpack.zip"
-rm -f serverpack.zip
+if [[ -n "$LOCAL_ZIP" ]]; then
+  # Unzip straight from the upload (no extra copy eating the disk quota).
+  unzip -q "$LOCAL_ZIP" -d .bb_tmp_unpack || die "Failed to unzip the uploaded server pack"
+else
+  unzip -q serverpack.zip -d .bb_tmp_unpack || die "Failed to unzip serverpack.zip"
+  rm -f serverpack.zip
+fi
 
 # Some CurseForge "server packs" are wrapped in a single top-level folder,
 # some are a zip inside the zip (e.g. Prominence II), and some place the real
@@ -698,7 +719,7 @@ echo "[curseforge] Install complete."
 # Write initial pack info for the website Version tab
 _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown')"
 jq -n \
-  --arg provider  "curseforge" \
+  --arg provider  "${PACK_PROVIDER_LABEL}" \
   --arg pack_id   "${PACK_ID}" \
   --arg file_id   "${VERSION_ID}" \
   --arg pack_name "${MOD_NAME}" \

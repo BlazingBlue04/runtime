@@ -482,11 +482,38 @@ fi
 # Same idea for every modpack provider: a blank PACK_ID with a lock for the same
 # provider means "keep what's installed" (e.g. right after an egg migration reset
 # the variables) — never "switch to an unknown pack and archive the world".
-if [[ -z "${PACK_ID_NORM:-}" && "$current_key" =~ ^(curseforge|modrinth|ftb)::([^:]+):: ]] \
+if [[ -z "${PACK_ID_NORM:-}" && "$current_key" =~ ^(curseforge|modrinth|ftb|zip)::([^:]+):: ]] \
    && [[ "${BASH_REMATCH[1]}" == "${PROVIDER:-}" ]]; then
   PACK_ID_NORM="${BASH_REMATCH[2]}"
   export PACK_ID_NORM
   bb_warn_status "PACK_ID is blank; keeping the installed ${PROVIDER} pack ${PACK_ID_NORM}. Set PACK_ID in startup variables."
+fi
+
+# ---------------------------------------
+# Uploaded server pack (PACK_PROVIDER=zip)
+#   PACK_ID  = the pack's identity (any name; the panel uses a slug). Same PACK_ID
+#              with a new zip = UPDATE (world kept). New PACK_ID = SWITCH (archived).
+#   Version  = a hash of the zip's contents, so re-uploading the same file is a no-op.
+# The panel uploads to .bb_upload/serverpack.zip. After a good install it becomes
+# .bb_upload/installed.zip (used for "reinstall"). See PANEL_CONTRACT.md.
+# ---------------------------------------
+ZIP_SLUG="" ZIP_VERSION="" ZIP_SRC=""
+if [[ "${PROVIDER:-}" == "zip" ]]; then
+  ZIP_SLUG="$(bb_zip_slug "${PACK_ID_NORM:-upload}")"
+  if [[ -f "$BB_UPLOAD_ZIP" ]]; then
+    ZIP_SRC="$BB_UPLOAD_ZIP"
+    ZIP_VERSION="$(bb_zip_id "$BB_UPLOAD_ZIP")"
+    log "Uploaded server pack found ($(du -h "$BB_UPLOAD_ZIP" 2>/dev/null | cut -f1), id ${ZIP_VERSION})."
+  elif [[ "$current_key" =~ ^zip::${ZIP_SLUG}::(.+)$ ]]; then
+    ZIP_VERSION="${BASH_REMATCH[1]}"          # nothing new uploaded: keep what's installed
+    [[ -f "$BB_UPLOAD_INSTALLED" ]] && ZIP_SRC="$BB_UPLOAD_INSTALLED"
+  elif [[ -f "$BB_UPLOAD_INSTALLED" ]]; then
+    ZIP_SRC="$BB_UPLOAD_INSTALLED"           # pack renamed in the panel: reinstall the kept zip under the new name
+    ZIP_VERSION="$(bb_zip_id "$BB_UPLOAD_INSTALLED")"
+  fi
+  # Panel status shows the pack as name + content hash.
+  [[ -n "$ZIP_VERSION" ]] && VERSION_ID_NORM="$ZIP_VERSION"
+  export ZIP_SLUG ZIP_VERSION ZIP_SRC VERSION_ID_NORM
 fi
 
 # -----------------------------
@@ -671,6 +698,9 @@ case "${PROVIDER:-unknown}" in
   modrinth|ftb)
     desired_key="${PROVIDER:-unknown}::${PACK_ID_NORM:-}::${VERSION_ID_NORM:-latest}"
     ;;
+  zip)
+    desired_key="zip::${ZIP_SLUG}::${ZIP_VERSION:-none}"
+    ;;
   bedrock)
     desired_key="bedrock::${BEDROCK_VERSION:-latest}::${BEDROCK_CHANNEL:-release}"
     ;;
@@ -736,8 +766,19 @@ if [[ "$has_any_start_artifact" -eq 0 ]]; then
   log "Start artifacts missing; forcing reinstall."
 fi
 
+_manual_env=0
+[[ "${MANUALLY_MANAGED:-false}" == "true" || "${MANUALLY_MANAGED:-false}" == "1" ]] && _manual_env=1
+
+# Uploaded pack selected, but nothing has ever been uploaded.
+if [[ "$need_reinstall" -eq 1 && "${PROVIDER:-}" == "zip" && -z "${ZIP_SRC}" && "$_manual_env" -eq 0 ]]; then
+  err "PACK_PROVIDER=zip but no server pack has been uploaded (expected ${BB_UPLOAD_ZIP})."
+  bb_status failed "No server pack uploaded" "" "" "Upload a server pack zip in the panel, then start the server."
+  exit 64
+fi
+
 # If reinstall needed but we still don't know which CurseForge project to install, fail loudly.
-if [[ "$need_reinstall" -eq 1 && "${PROVIDER:-}" == "curseforge" && -z "${CF_PROJECT_ID}" ]]; then
+# (Manually managed servers never install, so they don't need a project id.)
+if [[ "$need_reinstall" -eq 1 && "${PROVIDER:-}" == "curseforge" && -z "${CF_PROJECT_ID}" && "$_manual_env" -eq 0 ]]; then
   err "CURSEFORGE project id is not set. Set PACK_ID (or CF_PROJECT_ID / CURSEFORGE_PROJECT_ID / MODPACK_ID)."
   err "Example: CF_PROJECT_ID=905973 (Pokehaan Craft 2)"
   exit 64
@@ -757,6 +798,33 @@ run_installer() {
       # Export the resolved vars so curseforge_install.sh can read them from env
       export PACK_ID="${PACK_ID_NORM:-${CF_PROJECT_ID:-}}"
       export VERSION_ID="${VERSION_ID_NORM:-${CF_FILE_ID:-latest}}"
+      bash ./curseforge_install.sh
+      ;;
+    zip)
+      if [[ ! -f "./curseforge_install.sh" ]]; then
+        err "curseforge_install.sh missing."
+        exit 1
+      fi
+      if [[ -z "${ZIP_SRC:-}" || ! -f "${ZIP_SRC}" ]]; then
+        err "No uploaded server pack to install (expected ${BB_UPLOAD_ZIP})."
+        bb_status failed "No server pack uploaded" "" "" "Upload a server pack zip in the panel, then start the server."
+        exit 1
+      fi
+      bb_status installing "Checking the uploaded server pack"
+      local _zip_reason
+      if ! _zip_reason="$(bb_zip_validate "${ZIP_SRC}" 2>&1 >/dev/null)"; then
+        err "Uploaded server pack rejected: ${_zip_reason}"
+        # A warning survives the rollback to the previous server, so the panel still shows why.
+        bb_warn_status "The uploaded server pack was rejected: ${_zip_reason}"
+        bb_status failed "The uploaded server pack can't be used" "" "" "${_zip_reason}"
+        # It can never install, so don't retry it on every restart.
+        [[ "${ZIP_SRC}" == "$BB_UPLOAD_ZIP" ]] && rm -f -- "$BB_UPLOAD_ZIP"
+        exit 1
+      fi
+      export BB_LOCAL_ZIP="${DIR}/${ZIP_SRC}"
+      export BB_LOCAL_ZIP_NAME="${ZIP_NAME:-${PACK_ID_NORM:-Uploaded server pack}}"
+      export PACK_ID="${ZIP_SLUG}"
+      export VERSION_ID="${ZIP_VERSION}"
       bash ./curseforge_install.sh
       ;;
     modrinth)
@@ -1859,6 +1927,14 @@ if [[ "$BB_REQ_ACTION" == "reinstall" && "$MANUAL" -eq 0 ]]; then
   need_reinstall=1
 fi
 
+# The exact zip that's already installed was uploaded again: nothing to install,
+# so don't keep a second copy of it around eating the disk quota.
+if [[ "${PROVIDER:-}" == "zip" && "$need_reinstall" -eq 0 && "$desired_key" == "$current_key" && "${ZIP_SRC:-}" == "$BB_UPLOAD_ZIP" && -f "$BB_UPLOAD_ZIP" ]]; then
+  mv -f "$BB_UPLOAD_ZIP" "$BB_UPLOAD_INSTALLED"
+  ZIP_SRC="$BB_UPLOAD_INSTALLED"
+  log "Uploaded server pack matches what's installed — nothing to do."
+fi
+
 # A world can only be restored under the pack it was made with.
 if [[ "$BB_REQ_ACTION" == "restore_world" ]]; then
   _arch_key="$(bb_world_meta "$BB_REQ_ARCHIVE_ID" '.pack.key // empty' || true)"
@@ -2053,6 +2129,11 @@ if [[ "$need_reinstall" -eq 1 ]]; then
     fi
   fi
 
+    # Uploaded pack installed: keep it as installed.zip for "reinstall" (one copy only).
+    if [[ "${PROVIDER:-}" == "zip" && "${ZIP_SRC:-}" == "$BB_UPLOAD_ZIP" && -f "$BB_UPLOAD_ZIP" ]]; then
+      mv -f "$BB_UPLOAD_ZIP" "$BB_UPLOAD_INSTALLED"
+      log "Uploaded server pack kept as ${BB_UPLOAD_INSTALLED}."
+    fi
     if [[ "$IS_SWITCH" -eq 1 || -z "$CURRENT_PROVIDER" ]]; then
       bb_stash_commit switch
     else

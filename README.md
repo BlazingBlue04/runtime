@@ -8,7 +8,7 @@ Boot-time runtime for the **BlazingBlue Unified** Minecraft egg. On every server
 |---|---|
 | `switch_modpack.sh` | orchestrator: self-update, decide, archive, install, roll back, launch |
 | `bb_lib.sh` | shared helpers: status file, Java selection, loader installers, world archive, stash/rollback |
-| `curseforge_install.sh` | CurseForge packs (server pack, or client pack rebuilt from `manifest.json`) |
+| `curseforge_install.sh` | CurseForge packs (server pack, or client pack rebuilt from `manifest.json`); also installs uploaded server pack zips (`PACK_PROVIDER=zip`) |
 | `modrinth_install.sh` | Modrinth `.mrpack` (mods, overrides, and the loader from `dependencies`) |
 | `ftb_install.sh` | FTB packs via the official installer |
 | `generate_jvm_args.sh` | `user_jvm_args.txt` sized to the plan's RAM |
@@ -20,6 +20,9 @@ Boot-time runtime for the **BlazingBlue Unified** Minecraft egg. On every server
 ## What v2 changes
 
 **New**
+- **Uploaded server packs** (`PACK_PROVIDER=zip`): the panel uploads a zip to `.bb_upload/serverpack.zip` and the runtime checks, installs and runs it. See PANEL_CONTRACT.md.
+- The client mod cleaner keeps a built-in list of "looks client-only but needs a server channel" mods (Cosmetic Armor Reworked, Inventory Tweaks Refoxed, Waystones2Waypoints2).
+- `MANUALLY_MANAGED=true` servers on the CurseForge provider no longer fail with exit 64 when no project id is set.
 - Pack switches **archive** the old world to `.bb_worlds/` instead of deleting it. It can be restored from the panel.
 - Updates take a `pre_update` world backup first.
 - Installs are **transactional**: the old install is moved aside, and if the new one fails it is moved back and the old server boots.

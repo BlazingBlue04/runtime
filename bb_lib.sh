@@ -19,7 +19,7 @@
 [[ -n "${__BB_LIB_LOADED:-}" ]] && return 0
 __BB_LIB_LOADED=1
 
-BB_LIB_VERSION="2.0.4"
+BB_LIB_VERSION="2.1.0"
 BB_DIR="${BB_DIR:-${SERVER_DIR:-/home/container}}"
 BB_UA="${BB_UA:-BlazingBlue-runtime/${BB_LIB_VERSION} (support@blazingblue.org)}"
 
@@ -27,6 +27,12 @@ BB_STATUS_FILE="${BB_STATUS_FILE:-.bb_install_status.json}"
 BB_WORLDS_DIR=".bb_worlds"
 BB_WORLDS_INDEX=".bb_worlds.json"
 BB_STASH_DIR=".bb_prev_install"
+# Uploaded server packs (PACK_PROVIDER=zip). The panel drops the zip at
+# ${BB_UPLOAD_DIR}/serverpack.zip; after a good install it is kept as installed.zip
+# so "reinstall" works without uploading again.
+BB_UPLOAD_DIR=".bb_upload"
+BB_UPLOAD_ZIP="${BB_UPLOAD_DIR}/serverpack.zip"
+BB_UPLOAD_INSTALLED="${BB_UPLOAD_DIR}/installed.zip"
 
 _bbl()  { echo "[bb] $*" >&2; }
 _bbw()  { echo "[bb] WARN: $*" >&2; }
@@ -624,7 +630,7 @@ bb_world_prune() {
 _bb_keep_list() {
   local ln; ln="$(bb_level_name)"
   printf '%s\n' \
-    "$BB_STASH_DIR" "$BB_WORLDS_DIR" "$BB_WORLDS_INDEX" \
+    "$BB_STASH_DIR" "$BB_WORLDS_DIR" "$BB_WORLDS_INDEX" "$BB_UPLOAD_DIR" \
     "$BB_STATUS_FILE" .bb_request.json .bb_request.last.json \
     .bb_runtime_version .bb_last_crash.log .bb_wipe_consumed .bb_world_label \
     "$BB_WARN_FILE" .bb_pack_datapacks.txt \
@@ -772,4 +778,56 @@ bb_stash_rollback() {
   shopt -u dotglob nullglob
   rm -rf -- "${BB_STASH_DIR:?}"
   _bbl "Rolled back to the previous install (${scope})."
+}
+
+# =============================================================================
+# 7. Uploaded server pack checks (PACK_PROVIDER=zip)
+# =============================================================================
+
+# bb_zip_validate <zip>  — refuse anything that isn't a sane server pack zip.
+# Prints the reason on stderr and returns 1 on failure.
+#   BB_ZIP_MAX_MB  biggest uncompressed size allowed (default 30720 = 30 GB)
+bb_zip_validate() {
+  local z="$1" max_mb="${BB_ZIP_MAX_MB:-30720}" names total
+  if [[ ! -s "$z" ]]; then
+    _bbw "upload is missing or empty: $z"; echo "The uploaded file is empty." >&2; return 1
+  fi
+  if ! unzip -tqq "$z" >/dev/null 2>&1; then
+    echo "The upload is not a valid zip file, or it was cut off while uploading. Upload it again." >&2; return 1
+  fi
+  names="$(unzip -Z1 "$z" 2>/dev/null)" || { echo "Could not read the zip's file list." >&2; return 1; }
+  if [[ -z "$names" ]]; then
+    echo "The zip is empty." >&2; return 1
+  fi
+  # Paths must stay inside the server folder.
+  # (Backslash separators are fine: unzip converts them. Windows' own zip tool writes them.)
+  if grep -qE '(^/|^[A-Za-z]:|(^|[/\\])\.\.([/\\]|$))' <<<"$names"; then
+    echo "The zip contains files with unsafe paths (absolute paths or '..'). Rebuild it from the server folder." >&2; return 1
+  fi
+  # No symlinks: they could point outside the server folder.
+  if unzip -Zl "$z" 2>/dev/null | grep -qE '^l'; then
+    echo "The zip contains symbolic links, which aren't allowed. Rebuild it without links." >&2; return 1
+  fi
+  # Zip-bomb guard.
+  total="$(unzip -Zt "$z" 2>/dev/null | grep -oE '[0-9]+ bytes uncompressed' | grep -oE '^[0-9]+' || echo 0)"
+  if [[ "$total" =~ ^[0-9]+$ ]] && (( total > max_mb * 1024 * 1024 )); then
+    echo "The zip unpacks to $(( total / 1024 / 1024 )) MB, more than the ${max_mb} MB limit." >&2; return 1
+  fi
+  # Must look like a Minecraft server or modpack, not a random archive.
+  if ! grep -qiE '(^|/)(mods|config|libraries|overrides|kubejs|defaultconfigs)/|(^|/)(manifest\.json|variables\.txt|server\.properties|modrinth\.index\.json)$|\.jar$|\.zip$' <<<"$names"; then
+    echo "This doesn't look like a Minecraft server pack (no mods, config, libraries, jars or manifest.json)." >&2; return 1
+  fi
+  return 0
+}
+
+# bb_zip_id <zip>  — short content hash used as the pack "version" in the lock.
+bb_zip_id() {
+  sha256sum "$1" 2>/dev/null | cut -c1-16
+}
+
+# bb_zip_slug <text>  — a lock-safe pack identity (no ':' or spaces).
+bb_zip_slug() {
+  local s="${1,,}"
+  s="$(printf '%s' "$s" | tr -c 'a-z0-9._-' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//')"
+  printf '%s' "${s:-upload}"
 }
