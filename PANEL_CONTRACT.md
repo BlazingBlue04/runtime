@@ -69,6 +69,36 @@ pack's install. In that case nothing changes and a warning appears in the status
 ```
 Reinstalls the same pack and version. The world is kept.
 
+### Uploaded server pack (`PACK_PROVIDER=zip`)
+For customers who bring their own server pack zip (a pack not on CurseForge/Modrinth/FTB,
+or a hand-built one).
+
+1. Upload the zip to **`/.bb_upload/serverpack.zip`** (Pterodactyl files API or the
+   provisioner's direct upload). Write to a temp name and rename when complete, so a
+   half-written file is never picked up.
+2. Set `PACK_PROVIDER=zip` and `PACK_ID` to the pack's name (any text; the runtime
+   turns it into a slug such as `tensura-reformed`). `VERSION_ID` is ignored.
+3. Start the server (add a `switch` request with a `level_name` if you want one).
+
+What the runtime does:
+- Checks the zip first: valid zip, no absolute or `..` paths, no symlinks, under
+  `BB_ZIP_MAX_MB` uncompressed (default 30 GB), and looks like a Minecraft pack.
+  A rejected upload is **deleted** and the reason is put in `warnings` (and `error`
+  while it fails). The previous server keeps running.
+- Unpacks it with the CurseForge installer's logic: wrapper folders and zip-in-zip
+  are unwrapped, `overrides/` is applied, and if the loader isn't already installed
+  it's installed from `variables.txt` (ServerPackCreator) or `manifest.json`.
+- The lock is `zip::<slug>::<first 16 hex of sha256>`. **Same `PACK_ID`, new zip =
+  update** (world kept, `pre_update` backup). **New `PACK_ID` = switch** (world archived).
+  Uploading the exact same zip again does nothing.
+- After a good install the upload is kept as **`/.bb_upload/installed.zip`**, so the
+  `reinstall` request works without uploading again. Uploads count toward disk quota.
+- `PACK_PROVIDER=zip` with nothing ever uploaded fails with exit 64 and the status
+  "No server pack uploaded".
+
+`.bb_upload/` is never stashed or deleted by installs. Hide it from customer file
+listings if you like, but keep it writable for the panel's upload.
+
 ### Request rules
 - `id` is any string you choose. It is echoed back as `request_id` in the status, so
   you can tell your run apart from an older one.

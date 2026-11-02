@@ -653,6 +653,118 @@ boot "${CF[@]}" PACK_ID=222 VERSION_ID=2
 check "switch succeeded"                     jqt "$S/.bb_install_status.json" '.kind=="switch" and .state!="failed"'
 check "learned list kept"                    bash -c "grep -qx retrodamageindicators '$S/.bb_cleaner_learned.txt' && grep -qx distraction_free_recipes '$S/.bb_cleaner_learned.txt'"
 
+t "36. Cleaner never disables mods that need a server channel (even if Modrinth says client-only)"
+new_server cleaner-keep
+mkdir -p "$S/mods" "$S/mods_disabled"
+printf 'cos jar'  > "$S/mods/cosmeticarmorreworked-1.21.1-v1-neoforge.jar"
+printf 'inv jar'  > "$S/mods/invtweaks-1.21.1-1.3.2.jar"
+printf 'w2w2 jar' > "$S/mods_disabled/xaeros_waystones_compatibility-NeoForge-1.21.1-2.1.0.jar"
+echo "xaeros_waystones_compatibility-NeoForge-1.21.1-2.1.0.jar" > "$S/.bb_cleaner_disabled.txt"
+H_COS="$(sha1sum "$S/mods/cosmeticarmorreworked-1.21.1-v1-neoforge.jar" | cut -d' ' -f1)"
+H_INV="$(sha1sum "$S/mods/invtweaks-1.21.1-1.3.2.jar" | cut -d' ' -f1)"
+printf '{"%s":{"project_id":"COSAR"},"%s":{"project_id":"INVTW"}}' "$H_COS" "$H_INV" > "$SRV/mr-vf.json"
+echo '[{"id":"COSAR","title":"Cosmetic Armor Reworked","server_side":"unsupported"},{"id":"INVTW","title":"Inventory Tweaks Refoxed","server_side":"unsupported"}]' > "$SRV/mr-projects.json"
+env -i HOME="$HOME" PATH="${BIN}:${PATH}" FAKE_SRV="$SRV" SERVER_DIR="$S" \
+  bash "$S/clientmod_cleaner.sh" --apply > "$WORK/cleaner-keep.log" 2>&1; LAST_LOG="$WORK/cleaner-keep.log"
+check "Cosmetic Armor kept"                  test -f "$S/mods/cosmeticarmorreworked-1.21.1-v1-neoforge.jar"
+check "Inventory Tweaks kept"                test -f "$S/mods/invtweaks-1.21.1-1.3.2.jar"
+check "Waystones2Waypoints2 re-enabled"      test -f "$S/mods/xaeros_waystones_compatibility-NeoForge-1.21.1-2.1.0.jar"
+
+# ---------------------------------------------------------------------------
+# Uploaded server packs (PACK_PROVIDER=zip). These use the REAL curseforge_install.sh.
+# ---------------------------------------------------------------------------
+mkzip() {  # mkzip <out.zip> <tag> [wrap]  — a NeoForge server pack with the loader already installed
+  local out="$1" tag="$2" wrap="${3:-}" b="${WORK}/zipbuild-$RANDOM" root
+  root="$b"; [[ -n "$wrap" ]] && root="$b/$wrap"
+  mkdir -p "$root/mods" "$root/config" "$root/kubejs/server_scripts" "$root/libraries/net/neoforged/neoforge/21.1.265"
+  echo "mod $tag" > "$root/mods/pack-$tag.jar"
+  echo "cfg $tag" > "$root/config/pack.cfg"
+  echo "// $tag" > "$root/kubejs/server_scripts/x.js"
+  printf -- '-p libraries/x.jar\n--launchTarget forgeserver\n' > "$root/libraries/net/neoforged/neoforge/21.1.265/unix_args.txt"
+  printf '#!/bin/sh\necho start\n' > "$root/startserver.sh"
+  printf -- '-Xmx8G\n' > "$root/user_jvm_args.txt"
+  rm -f "$out"; (cd "$b" && zip -qr "$out" .)
+}
+upload() { mkdir -p "$S/.bb_upload"; cp "$1" "$S/.bb_upload/serverpack.zip"; }
+zip_server() { new_server "$1"; cp "${ROOT}/curseforge_install.sh" "$S/curseforge_install.sh"; }
+Z=(PACK_PROVIDER=zip)
+
+t "37. Uploaded server pack: fresh install"
+zip_server zip
+mkzip "$WORK/z1.zip" v1
+upload "$WORK/z1.zip"
+boot "${Z[@]}" PACK_ID="Tensura Reformed"
+check "boot succeeded"                       test "$RC" -eq 0
+check "lock is zip::tensura-reformed::<hash>" grep -qE '^zip::tensura-reformed::[0-9a-f]{16}$' "$S/.modpack.lock"
+check "pack files in place"                  test -f "$S/mods/pack-v1.jar" -a -f "$S/config/pack.cfg" -a -f "$S/kubejs/server_scripts/x.js"
+check "upload kept as installed.zip"         test -f "$S/.bb_upload/installed.zip" -a ! -f "$S/.bb_upload/serverpack.zip"
+check "pack info says zip"                   jqt "$S/.bb_pack_info.json" '.provider=="zip"'
+check "kind = install"                       jqt "$S/.bb_install_status.json" '.kind=="install" and .state!="failed"'
+check "started the pack (script or NeoForge)" bash -c "grep -qE 'DRY_START: .*(unix_args.txt|\.bb_tmp_start\.sh)' '$LAST_LOG'"
+
+t "38. Restart without a new upload does nothing"
+boot "${Z[@]}" PACK_ID="Tensura Reformed"
+check "kind = boot"                          jqt "$S/.bb_install_status.json" '.kind=="boot"'
+
+t "39. Same zip uploaded again: no reinstall, no second copy"
+upload "$WORK/z1.zip"
+boot "${Z[@]}" PACK_ID="Tensura Reformed"
+check "kind = boot"                          jqt "$S/.bb_install_status.json" '.kind=="boot"'
+check "duplicate upload dropped"             test ! -f "$S/.bb_upload/serverpack.zip" -a -f "$S/.bb_upload/installed.zip"
+
+t "40. New zip, same pack: update keeps the world"
+mkworld world "zip-world"
+mkzip "$WORK/z2.zip" v2
+upload "$WORK/z2.zip"
+boot "${Z[@]}" PACK_ID="Tensura Reformed"
+check "boot succeeded"                       test "$RC" -eq 0
+check "kind = update"                        jqt "$S/.bb_install_status.json" '.kind=="update"'
+check "new mods, old ones gone"              test -f "$S/mods/pack-v2.jar" -a ! -f "$S/mods/pack-v1.jar"
+check "world kept"                           has "$S/world/level.dat" "zip-world"
+check "pre_update backup taken"              jqt "$S/.bb_worlds.json" '[.archives[]|select(.reason=="pre_update")]|length==1'
+
+t "41. Reinstall request uses the kept zip"
+rm -f "$S/mods/pack-v2.jar"
+echo '{"id":"req-z","action":"reinstall"}' > "$S/.bb_request.json"
+boot "${Z[@]}" PACK_ID="Tensura Reformed"
+check "mods restored from installed.zip"     test -f "$S/mods/pack-v2.jar"
+check "world kept"                           has "$S/world/level.dat" "zip-world"
+
+t "42. Different pack name: switch archives the world"
+mkzip "$WORK/z3.zip" other wrapper-folder
+upload "$WORK/z3.zip"
+boot "${Z[@]}" PACK_ID="Other Pack"
+check "kind = switch"                        jqt "$S/.bb_install_status.json" '.kind=="switch"'
+check "old world archived"                   jqt "$S/.bb_worlds.json" '[.archives[]|select(.reason=="switch")]|length==1'
+check "wrapper folder flattened"             test -f "$S/mods/pack-other.jar" -a ! -d "$S/wrapper-folder"
+
+t "43. Bad uploads are refused; the running server is kept"
+printf 'not a zip' > "$S/.bb_upload/serverpack.zip"
+boot "${Z[@]}" PACK_ID="Other Pack"
+check "old pack still running"               test -f "$S/mods/pack-other.jar"
+check "failure reason shown"                 jqt "$S/.bb_install_status.json" '.warnings|map(test("not a valid zip"))|any'
+check "bad upload removed (no retry loop)"   test ! -f "$S/.bb_upload/serverpack.zip"
+B="${WORK}/evilbuild"; rm -rf "$B"; mkdir -p "$B/mods"; echo x > "$B/mods/a.jar"; ln -s /etc/passwd "$B/mods/link.jar"
+rm -f "$WORK/evil.zip"; (cd "$B" && zip -qry "$WORK/evil.zip" .)
+cp "$WORK/evil.zip" "$S/.bb_upload/serverpack.zip"
+boot "${Z[@]}" PACK_ID="Other Pack"
+check "symlink zip refused"                  bash -c "! test -L '$S/mods/link.jar'"
+check "symlink reason shown"                 bash -c "tr -d '\n' < '$S/.bb_install_status.json' | grep -q 'symbolic links'"
+
+t "44. zip provider with nothing uploaded fails clearly"
+zip_server zip-empty
+boot "${Z[@]}" PACK_ID="Nothing"
+check "exit 64"                              test "$RC" -eq 64
+check "status says upload one"               jqt "$S/.bb_install_status.json" '.state=="failed" and (tostring|test("No server pack uploaded"))'
+
+t "45. Manually managed server on CurseForge with no project id boots"
+new_server manual-cf
+mkdir -p "$S/libraries/net/neoforged/neoforge/21.1.265" "$S/mods"
+printf -- '-p x\n' > "$S/libraries/net/neoforged/neoforge/21.1.265/unix_args.txt"
+boot PACK_PROVIDER=curseforge MANUALLY_MANAGED=true
+check "no exit 64"                           test "$RC" -ne 64
+check "boot succeeded"                       test "$RC" -eq 0
+
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
 check "1.18.2 -> 17"  bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.18.2) == 17 ]]"

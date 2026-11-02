@@ -4,7 +4,7 @@
 #
 # Detection order (what actually runs by default):
 #   0. FORCE_DISABLE_PATTERNS        — known crashers, always disabled
-#   0b. BB_KEEP_MODS                 — admin allowlist, never disabled
+#   0b. ALWAYS_KEEP_PATTERNS + BB_KEEP_MODS — never disabled (built-in + admin allowlist)
 #   1. Modrinth lookup (by sha1)     — project says server_side "unsupported"
 #   2. CLIENT_ONLY_PATTERNS          — filename fallback for mods not on Modrinth
 #   3. Learned from crashes          — mods the last start named as loading client-only code
@@ -202,7 +202,6 @@ CLIENT_ONLY_PATTERNS=(
   "lootbeams*"        "toastcontrol*"      "ToastControl*"
   "light-overlay*"    "lightoverlay*"      "BetterAdvancements*"
   "Xaeros_Minimap*"   "XaerosWorldMap*"
-  "CosmeticArmorReworked*" "cosmeticarmorreworked*"
   "skinlayers*"       "3dskinlayers*"      "entityculling*"
   "not-enough-animations*" "visuality*"
 )
@@ -230,10 +229,28 @@ FORCE_DISABLE_PATTERNS=(
   "gtbcs_geomancy_plus*"                  # client-rendering addon for GTBC's Geomancy
 )
 
+# =============================================================================
+# ALWAYS-KEEP LIST — mods that look client-only (Modrinth or a filename pattern
+# says so) but register network channels, so a client joining a server without
+# them is kicked with "This channel is missing on the server side, but required
+# on the client!". Confirmed on real servers. Never disable these.
+# =============================================================================
+ALWAYS_KEEP_PATTERNS=(
+  "cosmeticarmorreworked*"               # Cosmetic Armor Reworked (open_cosarmor_inv etc.)
+  "invtweaks*"                           # Inventory Tweaks Refoxed (packet_sort_inv)
+  "xaeros_waystones_compatibility*"      # Waystones2Waypoints2 (w2w2:waystone_activated)
+)
+
 # BB_KEEP_MODS: comma-separated filename globs that must never be disabled
-# (escape hatch if Modrinth or a pattern is wrong about a mod).
+# (escape hatch if Modrinth or a pattern is wrong about a mod). The built-in
+# ALWAYS_KEEP_PATTERNS above are always kept as well.
 matches_keep() {
   local name_lower="${1,,}" pattern
+  for pattern in "${ALWAYS_KEEP_PATTERNS[@]}"; do
+    case "$name_lower" in
+      ${pattern,,}) return 0 ;;
+    esac
+  done
   [[ -n "${BB_KEEP_MODS:-}" ]] || return 1
   IFS=',' read -r -a _keep_pats <<< "${BB_KEEP_MODS}"
   for pattern in "${_keep_pats[@]}"; do
