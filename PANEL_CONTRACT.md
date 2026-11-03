@@ -277,7 +277,8 @@ export interface BBWorldArchive {
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RUNTIME_REF` | `v2.0.12` | git ref the runtime is pulled from |
+| `RUNTIME_REF` | `v2.1.1` | git ref the runtime is pulled from |
+| `MAX_PLAYERS` | 16 | player capacity; written to `max-players` in server.properties every boot (hidden egg variable, set by the website) |
 | `BB_WORLD_ARCHIVE_KEEP` | 5 | archives kept per reason |
 | `BB_BACKUP_KEEP` | 2 | pre-update backups kept (0 = no backups) |
 | `BB_ALLOW_MISSING_MODS` | 0 | 1 = finish a CurseForge install even if some mods failed to download |

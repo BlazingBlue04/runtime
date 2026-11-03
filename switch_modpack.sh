@@ -2309,6 +2309,39 @@ EOF
 }
 patch_server_port
 
+# ---------------------------------------
+# max-players cap — writes MAX_PLAYERS into server.properties every boot.
+# MAX_PLAYERS is a hidden egg variable the website sets from the customer's paid
+# player capacity, so edits made through the file manager / SFTP, or a pack that
+# ships its own server.properties, can't raise it. Wings also enforces it through
+# the egg's config parser; this covers the first boot after a pack install.
+# ---------------------------------------
+patch_max_players() {
+  local cap="${MAX_PLAYERS:-}"
+  if [[ -z "$cap" ]]; then
+    log "MAX_PLAYERS not set — leaving max-players alone."
+    return 0
+  fi
+  if [[ ! "$cap" =~ ^[0-9]+$ || "$cap" -lt 1 ]]; then
+    warn "MAX_PLAYERS='${cap}' is not a positive number — leaving max-players alone."
+    return 0
+  fi
+  if [[ ! -f ./server.properties ]]; then
+    # Bedrock ships its own file; Java gets the stub from patch_server_port.
+    : > ./server.properties
+  fi
+  local current
+  current="$(bb_prop_get max-players)"
+  current="${current//[[:space:]]/}"
+  if [[ "$current" == "$cap" ]]; then
+    log "server.properties: max-players already ${cap}."
+  else
+    bb_prop_set max-players "$cap"
+    log "server.properties: max-players ${current:-unset} -> ${cap} (player capacity)"
+  fi
+}
+patch_max_players
+
 # JVM args generator — regenerates user_jvm_args.txt based on SERVER_MEMORY
 # Ensures correct heap size even if RAM allocation changes between boots.
 # ---------------------------------------
