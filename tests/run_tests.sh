@@ -765,6 +765,25 @@ boot PACK_PROVIDER=curseforge MANUALLY_MANAGED=true
 check "no exit 64"                           test "$RC" -ne 64
 check "boot succeeded"                       test "$RC" -eq 0
 
+t "46. MAX_PLAYERS caps max-players every boot"
+new_server cap
+boot "${CF[@]}" PACK_ID=111 VERSION_ID=1001 MAX_PLAYERS=16
+check "boot succeeded"                       test "$RC" -eq 0
+check "max-players set on first install"     has "$S/server.properties" "max-players=16"
+bb_sp() { sed -i 's/^max-players=.*/max-players=100/' "$S/server.properties"; }
+bb_sp
+boot "${CF[@]}" PACK_ID=111 VERSION_ID=1001 MAX_PLAYERS=16
+check "hand edit to 100 pulled back to 16"   has "$S/server.properties" "max-players=16"
+check "only one max-players line"            test "$(grep -c '^max-players=' "$S/server.properties")" -eq 1
+boot "${CF[@]}" PACK_ID=222 VERSION_ID=2001 MAX_PLAYERS=24 FAKE_SHIP_PROPS=1 SERVER_PORT=25599
+check "pack switch uses paid cap (24)"       has "$S/server.properties" "max-players=24"
+check "port still patched"                   has "$S/server.properties" "server-port=25599"
+printf 'max-players=50\n' >> "$S/server.properties"
+boot "${CF[@]}" PACK_ID=222 VERSION_ID=2001
+check "no MAX_PLAYERS: file left alone"      has "$S/server.properties" "max-players=50"
+boot "${CF[@]}" PACK_ID=222 VERSION_ID=2001 MAX_PLAYERS=abc
+check "bad MAX_PLAYERS: boot still works"    test "$RC" -eq 0
+
 t "19. Java mapping"
 check "1.12.2 -> 8"   bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.12.2) == 8 ]]"
 check "1.18.2 -> 17"  bash -c "source '$ROOT/bb_lib.sh'; [[ \$(bb_java_major_for_mc 1.18.2) == 17 ]]"
