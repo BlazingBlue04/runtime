@@ -222,12 +222,16 @@ mkworld world "A-world"
 printf 'motd=My Cool Server\nlevel-name=world\nmax-players=30\n' > "$S/server.properties"
 echo '[{"name":"steve"}]' > "$S/ops.json"
 echo "custom" > "$S/config/customer-tweak.cfg"
+mkdir -p "$S/tensura_nations/season_results"; echo '{"hall":"S1"}' > "$S/tensura_nations/seasons.json"
+echo 'discordBotSecret = "keepme"' > "$S/config/tensura_nations-server.toml"
 boot "${CF[@]}" PACK_ID=111 VERSION_ID=1002
 check "boot succeeded"                       test "$RC" -eq 0
 check "kind = update"                        jqt "$S/.bb_install_status.json" '.kind=="update"'
 check "world still in place"                 has "$S/world/level.dat" "A-world"
 check "new version mods, old ones gone"      test -f "$S/mods/pack-111-1002.jar" -a ! -f "$S/mods/pack-111-1001.jar"
 check "ops.json preserved"                   has "$S/ops.json" "steve"
+check "season data folder untouched"         has "$S/tensura_nations/seasons.json" "S1"
+check "nations config kept across update"    has "$S/config/tensura_nations-server.toml" "keepme"
 check "server.properties preserved"          has "$S/server.properties" "motd=My Cool Server"
 check "pre_update backup exists"             jqt "$S/.bb_worlds.json" '[.archives[]|select(.reason=="pre_update")]|length==1'
 check "backup has the world"                 bash -c "ls $S/.bb_worlds/*pre_update*/files/world/level.dat"

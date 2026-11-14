@@ -634,6 +634,7 @@ _bb_keep_list() {
     "$BB_STATUS_FILE" .bb_request.json .bb_request.last.json \
     .bb_runtime_version .bb_last_crash.log .bb_wipe_consumed .bb_world_label \
     "$BB_WARN_FILE" .bb_pack_datapacks.txt \
+    tensura_nations \
     .modpack.lock eula.txt \
     backups archives world-backups .bb_backups \
     "${BB_RUNTIME_FILES[@]}"
@@ -655,6 +656,13 @@ _bb_keep_list() {
 BB_PLAYER_FILES=(
   ops.json whitelist.json banned-players.json banned-ips.json usercache.json
   usernamecache.json server-icon.png permissions.json allowlist.json
+)
+
+# Files from inside the pack's own folders (config/, ...) that hold a server owner's secrets or
+# settings and must survive a pack UPDATE. They are copied back over the pack's defaults.
+# The mod rewrites its config on load, so any keys a new version adds are filled in.
+BB_PRESERVE_FILES=(
+  config/tensura_nations-server.toml
 )
 
 # Loader artifacts touched by a light (standalone) reinstall.
@@ -723,6 +731,14 @@ bb_stash_commit() {
   for f in "${BB_PLAYER_FILES[@]}"; do
     [[ -e "${s}/${f}" ]] && cp -a -- "${s}/${f}" "./${f}" 2>/dev/null || true
   done
+  if [[ "$mode" == "update" ]]; then
+    for f in "${BB_PRESERVE_FILES[@]}"; do
+      if [[ -e "${s}/${f}" ]]; then
+        mkdir -p -- "$(dirname -- "./${f}")" 2>/dev/null || true
+        cp -a -- "${s}/${f}" "./${f}" 2>/dev/null || true
+      fi
+    done
+  fi
   if [[ -f "${s}/server.properties" ]]; then
     if [[ "$mode" == "switch" && -f server.properties ]]; then
       # New pack shipped its own server.properties (may need e.g. level-type for
