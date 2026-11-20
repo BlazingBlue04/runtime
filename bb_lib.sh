@@ -622,7 +622,7 @@ _bb_keep_list() {
     "$BB_STATUS_FILE" .bb_request.json .bb_request.last.json \
     .bb_runtime_version .bb_last_crash.log .bb_wipe_consumed .bb_world_label \
     "$BB_WARN_FILE" .bb_pack_datapacks.txt \
-    .modpack.lock eula.txt \
+    .modpack.lock eula.txt .bb_keep \
     backups archives world-backups .bb_backups \
     "${BB_RUNTIME_FILES[@]}"
   if [[ "${PROVIDER:-}" == "bedrock" ]]; then
@@ -703,6 +703,32 @@ bb_stash_install() {
   _bbl "Previous install stashed (${scope})."
 }
 
+# Optional per-server keep list: .bb_keep in the server folder, one path per line,
+# relative to the server folder (a file or a folder, e.g. "config/somemod-server.toml"
+# or "somemod_data"). After an update or switch, each listed path is copied back from
+# the previous install over whatever the new pack put there. Blank lines and lines
+# starting with # are ignored. Absolute paths and ".." are refused.
+_bb_restore_keep_files() {
+  local s="$1" line p
+  [[ -f .bb_keep ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    p="${line#"${line%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+    [[ -z "$p" || "$p" == \#* ]] && continue
+    p="${p#./}"; p="${p%/}"
+    if [[ "$p" == /* || "/${p}/" == */../* || "/${p}/" == */./* || -z "$p" ]]; then
+      _bbw ".bb_keep: refused unsafe path '${line}'"; continue
+    fi
+    if [[ ! -e "${s}/${p}" && ! -L "${s}/${p}" ]]; then
+      _bbl ".bb_keep: '${p}' wasn't in the previous install (or was never moved), nothing to carry over"; continue
+    fi
+    mkdir -p -- "$(dirname -- "./${p}")"
+    rm -rf -- "./${p}"
+    if cp -a -- "${s}/${p}" "./${p}"; then _bbl ".bb_keep: kept '${p}' from the previous install"
+    else _bbw ".bb_keep: could not copy back '${p}'"; fi
+  done < .bb_keep
+}
+
 # After a successful install: copy player files back, handle server.properties, drop the stash.
 # bb_stash_commit <update|switch>
 bb_stash_commit() {
@@ -711,6 +737,7 @@ bb_stash_commit() {
   for f in "${BB_PLAYER_FILES[@]}"; do
     [[ -e "${s}/${f}" ]] && cp -a -- "${s}/${f}" "./${f}" 2>/dev/null || true
   done
+  _bb_restore_keep_files "$s"
   if [[ -f "${s}/server.properties" ]]; then
     if [[ "$mode" == "switch" && -f server.properties ]]; then
       # New pack shipped its own server.properties (may need e.g. level-type for

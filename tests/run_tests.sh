@@ -220,6 +220,9 @@ mkworld world "A-world"
 printf 'motd=My Cool Server\nlevel-name=world\nmax-players=30\n' > "$S/server.properties"
 echo '[{"name":"steve"}]' > "$S/ops.json"
 echo "custom" > "$S/config/customer-tweak.cfg"
+mkdir -p "$S/mydata/sub"; echo "season-1" > "$S/mydata/sub/state.json"
+echo "secret=abc" > "$S/config/mymod-server.toml"
+printf '# keep these\nmydata/\r\n  config/mymod-server.toml  \n../etc/passwd\n/etc/hosts\nnot/there\n' > "$S/.bb_keep"
 boot "${CF[@]}" PACK_ID=111 VERSION_ID=1002
 check "boot succeeded"                       test "$RC" -eq 0
 check "kind = update"                        jqt "$S/.bb_install_status.json" '.kind=="update"'
@@ -229,6 +232,11 @@ check "ops.json preserved"                   has "$S/ops.json" "steve"
 check "server.properties preserved"          has "$S/server.properties" "motd=My Cool Server"
 check "pre_update backup exists"             jqt "$S/.bb_worlds.json" '[.archives[]|select(.reason=="pre_update")]|length==1'
 check "backup has the world"                 bash -c "ls $S/.bb_worlds/*pre_update*/files/world/level.dat"
+check ".bb_keep itself survives"             test -f "$S/.bb_keep"
+check ".bb_keep folder carried over"         has "$S/mydata/sub/state.json" "season-1"
+check ".bb_keep single config file kept"     has "$S/config/mymod-server.toml" "secret=abc"
+check ".bb_keep doesn't keep other config"   test ! -f "$S/config/customer-tweak.cfg"
+check ".bb_keep refuses unsafe paths"        has "$LAST_LOG" "refused unsafe path '../etc/passwd'"
 
 t "4. Switch pack with a new world name"
 echo '{"id":"req-1","action":"switch","level_name":"Skyblock Fun!"}' > "$S/.bb_request.json"
